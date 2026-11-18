@@ -39,6 +39,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "fatfs.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -46,6 +47,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <math.h>
+
+#include "sd_logger.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -118,6 +121,9 @@
 #define DEBUG_UART_ENABLE         1
 #endif
 
+#define SD_LOG_ENABLE             1   /* 1 = log to the SD card */
+#define SD_LOG_EVERY_N_LOOPS      1   /* 1 = a row every loop (50 Hz)
+
 
 /* >>>>>> 1B. RECEIVER SETTINGS: radio, packet layout, sticks and buttons  <<<<<< */
 /* ==========================================================================================
@@ -186,8 +192,8 @@ enum { AX_LX = 0, AX_LY = 1, AX_RX = 2, AX_RY = 3 };
  * THROTTLE_INTEGRATE 1: pushing the stick up raises throttle, pulling down lowers it, centre holds it (like a trigger).
  * THROTTLE_INTEGRATE 0: the stick position IS the throttle (use only if the throttle axis does not spring back). */
 #define THROTTLE_INTEGRATE        1
-#define THROTTLE_RATE_US_PER_SEC  300          /* full stick deflection changes throttle by this many us per second */
-#define THROTTLE_MAX_US           1050         /* hard cap on throttle from the controller. Raise slowly during testing */
+#define THROTTLE_RATE_US_PER_SEC  75          /* full stick deflection changes throttle by this many us per second */
+#define THROTTLE_MAX_US           1500         /* hard cap on throttle from the controller. Raise slowly during testing */
 
 
 /* >>>>>> 1C. FC LINK AND SAFETY: MSP constants, loop timing, failsafe <<<<<< */
@@ -362,6 +368,9 @@ volatile uint32_t fcAnalogOkCount = 0, fcAnalogFailCount = 0;
 volatile uint8_t  battLowLatched = 0;                 /* 1 = the battery cutoff has tripped (clears only on reset) */
 static uint16_t   lastSentRc[RC_CHANNEL_COUNT];       /* what we sent to the FC last loop, for the MSP_RC comparison */
 static uint8_t    lastSentRcValid = 0;
+
+static log_record_t g_log;
+volatile logger_status_t sdLogStatus = LOG_ERR_NO_CARD;
 
 /* USER CODE END PV */
 
@@ -1140,6 +1149,7 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART6_UART_Init();
   MX_SPI2_Init();
+  MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
 
   LED_OFF(LED_LINK_PORT, LED_LINK_PIN);
@@ -1316,6 +1326,11 @@ int main(void)
   {
     dbg_printf("LoRa radio FAILED - check SPI1 wiring (PA4/5/6/7, PB0 reset) and the RFM95W 3.3 V supply\r\n");
   }
+#endif
+
+#if SD_LOG_ENABLE
+  sdLogStatus = Logger_Init();
+  dbg_printf("SD log: status=%d file=%s\r\n", (int)sdLogStatus, Logger_FileName());
 #endif
 
   /* Give the FC time to boot, then check the MSP link */
@@ -1834,6 +1849,19 @@ int main(void)
     }
 #endif
 
+#if SD_LOG_ENABLE
+    if ((debugLoopCounter % SD_LOG_EVERY_N_LOOPS) == 0)
+    {
+      g_log.t_ms     = HAL_GetTick();
+      g_log.thr_tx   = txThrottleDbg;
+      g_log.arm_tx   = (txArmDbg > 1500);
+      g_log.fc_armed = fcArmed;
+      g_log.link_ok  = pilotLinkAlive;
+      Logger_Push(&g_log);
+    }
+    Logger_Service();
+#endif
+
     /* loop timing instrumentation: counts only once the baseline is locked */
     loopWorkMs = (uint16_t)(HAL_GetTick() - loopStart);
     if (baselineCaptured)
@@ -1879,8 +1907,8 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 16;
-  RCC_OscInitStruct.PLL.PLLN = 200;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 96;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 4;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
@@ -1926,7 +1954,7 @@ static void MX_SPI2_Init(void)
   hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi2.Init.NSS = SPI_NSS_SOFT;
-  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_128;
   hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -2055,7 +2083,23 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5|GPIO_PIN_6, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : SD_CD_Pin */
+  GPIO_InitStruct.Pin = SD_CD_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(SD_CD_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : SD_CS_Pin */
+  GPIO_InitStruct.Pin = SD_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(SD_CS_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PB5 PB6 */
   GPIO_InitStruct.Pin = GPIO_PIN_5|GPIO_PIN_6;
