@@ -179,9 +179,9 @@
  * Applies to every pilot input source (LoRa or CRSF). Throttle is not scaled (it has THROTTLE_MAX_US).
  * The correction still decides "is the pilot using this axis?" from the stick BEFORE scaling,
  * so CORRECTION_STICK_DEADBAND_US keeps meaning the same physical stick movement at any scale. */
-#define STICK_SCALE_ROLL_PCT      30
-#define STICK_SCALE_PITCH_PCT     30
-#define STICK_SCALE_YAW_PCT       30
+#define STICK_SCALE_ROLL_PCT      20
+#define STICK_SCALE_PITCH_PCT     20
+#define STICK_SCALE_YAW_PCT       20
 /* Stick hold: when 1, letting a stick spring back to centre keeps the last push instead of returning to 0.
  *   - Each push sets that axis to the FURTHEST point reached during the push (so the spring-back on release
  *     doesn't change it). Pushing harder raises it; a new push in the same direction replaces it.
