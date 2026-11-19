@@ -39,6 +39,7 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "fatfs.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
@@ -46,6 +47,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <math.h>
+
+#include "sd_logger.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -118,6 +121,9 @@
 #define DEBUG_UART_ENABLE         1
 #endif
 
+#define SD_LOG_ENABLE             1   /* 1 = log to the SD card */
+#define SD_LOG_EVERY_N_LOOPS      1   /* 1 = a row every loop (50 Hz)
+
 
 /* >>>>>> 1B. RECEIVER SETTINGS: radio, packet layout, sticks and buttons  <<<<<< */
 /* ==========================================================================================
@@ -162,9 +168,9 @@
 #define AXIS_RAW_MIN              (-100)       /* value with the stick fully one way  */
 #define AXIS_RAW_CENTER           0            /* value with the stick released       */
 #define AXIS_RAW_MAX              100          /* value with the stick fully the other way */
-#define AXIS_LX_INVERT            0            /* flip direction: set 1 if the drone moves the wrong way (check stickUs[] / Betaflight Receiver tab) */
+#define AXIS_LX_INVERT            1            /* YAW inverted (left stick left/right). flip direction: set 1 if the drone moves the wrong way (check stickUs[] / Betaflight Receiver tab) */
 #define AXIS_LY_INVERT            0
-#define AXIS_RX_INVERT            0
+#define AXIS_RX_INVERT            1            /* ROLL inverted (right stick left/right) */
 #define AXIS_RY_INVERT            0
 #define STICK_DEADBAND_US         25           /* ignore tiny stick offsets (stick drift) */
 
@@ -186,8 +192,8 @@ enum { AX_LX = 0, AX_LY = 1, AX_RX = 2, AX_RY = 3 };
  * THROTTLE_INTEGRATE 1: pushing the stick up raises throttle, pulling down lowers it, centre holds it (like a trigger).
  * THROTTLE_INTEGRATE 0: the stick position IS the throttle (use only if the throttle axis does not spring back). */
 #define THROTTLE_INTEGRATE        1
-#define THROTTLE_RATE_US_PER_SEC  300          /* full stick deflection changes throttle by this many us per second */
-#define THROTTLE_MAX_US           1050         /* hard cap on throttle from the controller. Raise slowly during testing */
+#define THROTTLE_RATE_US_PER_SEC  75          /* full stick deflection changes throttle by this many us per second */
+#define THROTTLE_MAX_US           1500         /* hard cap on throttle from the controller. Raise slowly during testing */
 
 
 /* >>>>>> 1C. FC LINK AND SAFETY: MSP constants, loop timing, failsafe <<<<<< */
@@ -199,6 +205,18 @@ enum { AX_LX = 0, AX_LY = 1, AX_RX = 2, AX_RY = 3 };
 #define MSP_ATTITUDE              108
 #define MSP_SET_RAW_RC            200
 #define MSP_SET_ARMING_DISABLED   239
+#define MSP_RC                    105
+#define MSP_ANALOG                110
+
+/* ---- Extra FC readings: armed state (MSP_STATUS), the channels the FC received (MSP_RC), battery (MSP_ANALOG) ---- */
+#define FC_EXTRA_POLL_ENABLE        1    /* 1 = read these three from the FC; 0 = switch them off */
+#define FC_EXTRA_POLL_EVERY_N_LOOPS 3    /* one extra MSP request every N loops (20 ms each), cycling STATUS -> RC -> ANALOG, so each is
+                                          * refreshed every 3*N loops (180 ms at N=3). Each request costs a few ms on the 115200 baud link:
+                                          * watch loopWorkMsMax and loopOverrunCount, and raise N if the loop starts overrunning */
+#define FC_RC_ECHO_TOLERANCE_US     3    /* the FC's echo of a channel may differ from what we sent by this much before it counts as a mismatch */
+#define BATT_CUTOFF_ENABLE          0    /* 1 = force disarm and minimum throttle when the battery stays below BATT_CUTOFF_DECIV */
+#define BATT_CUTOFF_DECIV           0    /* cutoff in 0.1 V units (180 = 18.0 V). Set it for your pack BEFORE enabling; 0 = never trips */
+#define BATT_CUTOFF_READS           5    /* consecutive low readings needed before it trips (each reading is ~180 ms apart) */
 #define RC_CHANNEL_COUNT          8
 
 #define CRSF_SYNC_BYTE            0xC8
@@ -333,6 +351,26 @@ volatile uint16_t loopWorkMsMax = 0;     /* worst loop since baseline lock */
 volatile uint32_t loopOverrunCount = 0;  /* loops whose work exceeded LOOP_PERIOD_MS */
 volatile uint32_t loopWorkSumMs = 0;     /* sum of work times since baseline lock */
 volatile uint32_t loopWorkN = 0;         /* loops counted since baseline lock */
+
+/* Extra FC readings (MSP_STATUS / MSP_RC / MSP_ANALOG): add these to Live Expressions */
+volatile uint8_t  fcArmed = 0;                        /* the FC's own armed state (MSP_STATUS flight-mode bit 0) */
+volatile uint16_t fcCycleTimeUs = 0;                  /* the FC's PID loop time in microseconds */
+volatile uint16_t fcSensors = 0;                      /* MSP_STATUS sensor-present bits */
+volatile uint32_t fcModeFlags = 0;                    /* MSP_STATUS flight-mode flags */
+volatile uint16_t fcRc[RC_CHANNEL_COUNT] = {0};       /* the channels the FC says it received (MSP_RC) */
+volatile uint32_t fcRcMismatchCount = 0;              /* echoes that did not match what we last sent */
+volatile uint16_t fcVbatDeci = 0;                     /* battery voltage in 0.1 V (MSP_ANALOG) */
+volatile uint16_t fcMahDrawn = 0;                     /* mAh drawn */
+volatile int16_t  fcAmpsCenti = 0;                    /* current in 0.01 A (0 unless the FC has a current sensor set up) */
+volatile uint32_t fcStatusOkCount = 0, fcStatusFailCount = 0;
+volatile uint32_t fcRcOkCount = 0,     fcRcFailCount = 0;
+volatile uint32_t fcAnalogOkCount = 0, fcAnalogFailCount = 0;
+volatile uint8_t  battLowLatched = 0;                 /* 1 = the battery cutoff has tripped (clears only on reset) */
+static uint16_t   lastSentRc[RC_CHANNEL_COUNT];       /* what we sent to the FC last loop, for the MSP_RC comparison */
+static uint8_t    lastSentRcValid = 0;
+
+static log_record_t g_log;
+volatile logger_status_t sdLogStatus = LOG_ERR_NO_CARD;
 
 /* USER CODE END PV */
 
@@ -539,6 +577,59 @@ static HAL_StatusTypeDef msp_get_motors(UART_HandleTypeDef *huart, uint16_t *out
     out4[i] = (uint16_t)(resp.payload[i * 2] | (resp.payload[i * 2 + 1] << 8));
   }
 
+  return HAL_OK;
+}
+
+/* MSP_STATUS: loop time, sensors and the flight-mode flags. Bit 0 of the flags is ARM (the FC's own armed state). */
+static HAL_StatusTypeDef msp_get_status(UART_HandleTypeDef *huart, uint16_t *cycleUs, uint16_t *sensors, uint32_t *modeFlags)
+{
+  MspResponse resp;
+
+  msp_flush_rx(huart);
+  msp_send_request(huart, MSP_STATUS, NULL, 0);
+
+  if (msp_read_response(huart, &resp, 100) != HAL_OK) return HAL_ERROR;
+  if (resp.direction != '>' || resp.cmd != MSP_STATUS || resp.size < 10) return HAL_ERROR;
+
+  *cycleUs   = (uint16_t)(resp.payload[0] | (resp.payload[1] << 8));
+  *sensors   = (uint16_t)(resp.payload[4] | (resp.payload[5] << 8));
+  *modeFlags = (uint32_t)resp.payload[6] | ((uint32_t)resp.payload[7] << 8) |
+               ((uint32_t)resp.payload[8] << 16) | ((uint32_t)resp.payload[9] << 24);
+  return HAL_OK;
+}
+
+/* MSP_RC: the channel values the FC currently holds (uint16 each). We keep the first RC_CHANNEL_COUNT. */
+static HAL_StatusTypeDef msp_get_rc(UART_HandleTypeDef *huart, uint16_t *out)
+{
+  MspResponse resp;
+
+  msp_flush_rx(huart);
+  msp_send_request(huart, MSP_RC, NULL, 0);
+
+  if (msp_read_response(huart, &resp, 100) != HAL_OK) return HAL_ERROR;
+  if (resp.direction != '>' || resp.cmd != MSP_RC || resp.size < (RC_CHANNEL_COUNT * 2)) return HAL_ERROR;
+
+  for (uint8_t i = 0; i < RC_CHANNEL_COUNT; i++)
+  {
+    out[i] = (uint16_t)(resp.payload[i * 2] | (resp.payload[i * 2 + 1] << 8));
+  }
+  return HAL_OK;
+}
+
+/* MSP_ANALOG: battery voltage (uint8, 0.1 V), mAh drawn (uint16), RSSI (uint16), current (int16, 0.01 A) */
+static HAL_StatusTypeDef msp_get_analog(UART_HandleTypeDef *huart, uint16_t *vbatDeci, uint16_t *mAh, int16_t *ampsCenti)
+{
+  MspResponse resp;
+
+  msp_flush_rx(huart);
+  msp_send_request(huart, MSP_ANALOG, NULL, 0);
+
+  if (msp_read_response(huart, &resp, 100) != HAL_OK) return HAL_ERROR;
+  if (resp.direction != '>' || resp.cmd != MSP_ANALOG || resp.size < 7) return HAL_ERROR;
+
+  *vbatDeci  = resp.payload[0];
+  *mAh       = (uint16_t)(resp.payload[1] | (resp.payload[2] << 8));
+  *ampsCenti = (int16_t)(resp.payload[5] | (resp.payload[6] << 8));
   return HAL_OK;
 }
 
@@ -1058,6 +1149,7 @@ int main(void)
   MX_USART1_UART_Init();
   MX_USART6_UART_Init();
   MX_SPI2_Init();
+  MX_FATFS_Init();
   /* USER CODE BEGIN 2 */
 
   LED_OFF(LED_LINK_PORT, LED_LINK_PIN);
@@ -1234,6 +1326,11 @@ int main(void)
   {
     dbg_printf("LoRa radio FAILED - check SPI1 wiring (PA4/5/6/7, PB0 reset) and the RFM95W 3.3 V supply\r\n");
   }
+#endif
+
+#if SD_LOG_ENABLE
+  sdLogStatus = Logger_Init();
+  dbg_printf("SD log: status=%d file=%s\r\n", (int)sdLogStatus, Logger_FileName());
 #endif
 
   /* Give the FC time to boot, then check the MSP link */
@@ -1597,12 +1694,106 @@ int main(void)
       }
     }
 
+    /* ---- 5b. Extra FC readings: its armed state, the channels it received, and the battery ---- */
+#if FC_EXTRA_POLL_ENABLE
+    if ((debugLoopCounter % FC_EXTRA_POLL_EVERY_N_LOOPS) == 0)
+    {
+      switch ((debugLoopCounter / FC_EXTRA_POLL_EVERY_N_LOOPS) % 3)
+      {
+        case 0:   /* MSP_STATUS */
+        {
+          uint16_t cyc = 0, sens = 0;
+          uint32_t flags = 0;
+          if (msp_get_status(&huart1, &cyc, &sens, &flags) == HAL_OK)
+          {
+            fcCycleTimeUs = cyc;
+            fcSensors     = sens;
+            fcModeFlags   = flags;
+            fcArmed       = (uint8_t)(flags & 1u);
+            fcStatusOkCount++;
+          }
+          else
+          {
+            fcStatusFailCount++;
+          }
+          break;
+        }
+        case 1:   /* MSP_RC: compare the FC's echo with what we sent last loop */
+        {
+          uint16_t rc[RC_CHANNEL_COUNT];
+          if (msp_get_rc(&huart1, rc) == HAL_OK)
+          {
+            uint8_t mismatch = 0;
+            for (uint8_t i = 0; i < RC_CHANNEL_COUNT; i++)
+            {
+              fcRc[i] = rc[i];
+              if (lastSentRcValid)
+              {
+                int32_t d = (int32_t)rc[i] - (int32_t)lastSentRc[i];
+                if (d < 0) d = -d;
+                if (d > FC_RC_ECHO_TOLERANCE_US) mismatch = 1;
+              }
+            }
+            if (mismatch) fcRcMismatchCount++;
+            fcRcOkCount++;
+          }
+          else
+          {
+            fcRcFailCount++;
+          }
+          break;
+        }
+        default:  /* MSP_ANALOG, and the optional low-battery cutoff */
+        {
+          static uint8_t battLowCount = 0;
+          uint16_t vb = 0, mah = 0;
+          int16_t amps = 0;
+          if (msp_get_analog(&huart1, &vb, &mah, &amps) == HAL_OK)
+          {
+            fcVbatDeci  = vb;
+            fcMahDrawn  = mah;
+            fcAmpsCenti = amps;
+            fcAnalogOkCount++;
+#if BATT_CUTOFF_ENABLE
+            if (BATT_CUTOFF_DECIV > 0 && vb > 0 && vb < BATT_CUTOFF_DECIV)
+            {
+              if (battLowCount < 255) battLowCount++;
+              if (battLowCount >= BATT_CUTOFF_READS) battLowLatched = 1;
+            }
+            else
+            {
+              battLowCount = 0;
+            }
+#else
+            (void)battLowCount;
+#endif
+          }
+          else
+          {
+            fcAnalogFailCount++;
+          }
+          break;
+        }
+      }
+    }
+#endif
+
+#if BATT_CUTOFF_ENABLE
+    if (battLowLatched)
+    {
+      txChannels[2] = 1000;   /* minimum throttle */
+      txChannels[4] = 1000;   /* disarm */
+    }
+#endif
+
     /* ---- 6. Send to the FC: pilot input + correction bias ------------------- */
     txRollDbg     = txChannels[0];
     txPitchDbg    = txChannels[1];
     txThrottleDbg = txChannels[2];
     txArmDbg      = txChannels[4];
     msp_set_raw_rc(&huart1, txChannels, RC_CHANNEL_COUNT);
+    for (uint8_t i = 0; i < RC_CHANNEL_COUNT; i++) lastSentRc[i] = txChannels[i];
+    lastSentRcValid = 1;
 
     /* ---- 7. Logging --------------------------------------------------------- */
 #if LOG_CSV_ENABLE
@@ -1629,6 +1820,18 @@ int main(void)
                    deltaPitch > ATTITUDE_DISTURBANCE_THRESHOLD_DECIDEG || deltaPitch < -ATTITUDE_DISTURBANCE_THRESHOLD_DECIDEG) ? " DISTURBANCE" : ""));
     }
 
+#if FC_EXTRA_POLL_ENABLE
+    if ((debugLoopCounter % STATUS_PRINT_EVERY_N_LOOPS) == 0)
+    {
+      dbg_printf("FC: armed=%u cycle=%uus vbat=%u.%uV amps(0.01A)=%d used=%umAh rcMismatch=%lu fails st=%lu rc=%lu an=%lu%s\r\n",
+                 (unsigned)fcArmed, (unsigned)fcCycleTimeUs,
+                 (unsigned)(fcVbatDeci / 10), (unsigned)(fcVbatDeci % 10), (int)fcAmpsCenti, (unsigned)fcMahDrawn,
+                 (unsigned long)fcRcMismatchCount,
+                 (unsigned long)fcStatusFailCount, (unsigned long)fcRcFailCount, (unsigned long)fcAnalogFailCount,
+                 battLowLatched ? " BATTERY CUTOFF" : "");
+    }
+#endif
+
 #if INPUT_SOURCE == INPUT_LORA
     if ((debugLoopCounter % STATUS_PRINT_EVERY_N_LOOPS) == 0)
     {
@@ -1644,6 +1847,19 @@ int main(void)
       lastStatsPrint = HAL_GetTick();
       if (baselineCaptured) stats_print();
     }
+#endif
+
+#if SD_LOG_ENABLE
+    if ((debugLoopCounter % SD_LOG_EVERY_N_LOOPS) == 0)
+    {
+      g_log.t_ms     = HAL_GetTick();
+      g_log.thr_tx   = txThrottleDbg;
+      g_log.arm_tx   = (txArmDbg > 1500);
+      g_log.fc_armed = fcArmed;
+      g_log.link_ok  = pilotLinkAlive;
+      Logger_Push(&g_log);
+    }
+    Logger_Service();
 #endif
 
     /* loop timing instrumentation: counts only once the baseline is locked */
@@ -1691,8 +1907,8 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 16;
-  RCC_OscInitStruct.PLL.PLLN = 200;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 96;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 4;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
@@ -1738,7 +1954,7 @@ static void MX_SPI2_Init(void)
   hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi2.Init.NSS = SPI_NSS_SOFT;
-  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_128;
   hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -1867,7 +2083,23 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5|GPIO_PIN_6, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : SD_CD_Pin */
+  GPIO_InitStruct.Pin = SD_CD_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(SD_CD_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : SD_CS_Pin */
+  GPIO_InitStruct.Pin = SD_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(SD_CS_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PB5 PB6 */
   GPIO_InitStruct.Pin = GPIO_PIN_5|GPIO_PIN_6;
