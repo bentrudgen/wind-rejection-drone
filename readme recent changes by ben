@@ -1,0 +1,168 @@
+# Companion Board: what's new
+
+**Three changes since the 19 Nov zip:**
+
+1. The SD card log now records **battery voltage, current, and roll/pitch/yaw**.
+2. **Yaw** can now be watched in Live Expressions, like roll and pitch.
+3. You can choose **starting roll/pitch/yaw values when arming**, like the throttle starting at 1200.
+
+**Files to replace:** `Core/Src/main.c`, `Core/Inc/sd_logger.h`, `Core/Src/sd_logger.c`
+
+---
+
+## ⚙️ Settings you can change
+
+All of these are `#define` lines near the top of `main.c`. To change one, edit the number, rebuild and flash.
+Use **Ctrl+F** with the setting name to find it. 🆕 marks settings added in this update.
+
+### Stick feel
+
+| Setting | Now | What it does |
+|---|---|---|
+| `STICK_SCALE_ROLL_PCT` | **20** | How much of the full range the roll stick uses. 20 means full stick sends only 1400–1600 (gentle). 100 means full range (1000–2000). |
+| `STICK_SCALE_PITCH_PCT` | **20** | Same, for pitch |
+| `STICK_SCALE_YAW_PCT` | **20** | Same, for yaw |
+| `STICK_DEADBAND_US` | 25 | Tiny stick movements near centre are ignored (stops drift). Raise it if the drone creeps with sticks centred. |
+
+### Stick hold (sticks keep their last push instead of springing back)
+
+| Setting | Now | What it does |
+|---|---|---|
+| `STICK_HOLD_ENABLE` | **1** | **1:** let go of a stick and the drone keeps doing what you last pushed. **0:** normal, sticks return to centre. |
+| `STICK_HOLD_ROLL` | 1 | Turn hold on (1) or off (0) for roll only |
+| `STICK_HOLD_PITCH` | 1 | Same, for pitch |
+| `STICK_HOLD_YAW` | 1 | Same, for yaw. A held yaw means constant spinning, so consider 0 for first flights. |
+| `STICK_HOLD_MIN_PUSH_US` | 100 | How far you must push before it counts (500 = full stick, so 100 = 20%). Raise it if bumps set holds by accident. |
+
+How hold works: push and let go, and it holds the furthest point you reached. Push the same way to set a new value. **Push the opposite way to return to centre.** Disarming clears everything.
+
+### Arming and throttle
+
+| Setting | Now | What it does |
+|---|---|---|
+| `THROTTLE_ARMED_START_US` | **1200** | Throttle jumps here half a second after arming. Keep it below the throttle where the drone lifts off. |
+| 🆕 `ARMED_START_ROLL_US` | **1500** | Roll value the drone starts with after arming. 1500 = centre. Allowed range is **1400–1600** at 20% scale. |
+| 🆕 `ARMED_START_PITCH_US` | **1500** | Same, for pitch |
+| 🆕 `ARMED_START_YAW_US` | **1500** | Same, for yaw |
+| `THROTTLE_RATE_US_PER_SEC` | 75 | How fast the throttle stick changes throttle. Lower means finer altitude control. |
+| `THROTTLE_MAX_US` | 1500 | Throttle can never go above this, whatever the stick does. |
+| `THROTTLE_ARM_HOLD_MS` | 500 | Throttle is held at minimum this long after ARM so Betaflight accepts the arm. **Leave as is.** |
+| `PILOT_FAILSAFE_TIMEOUT_MS` | 500 | If the controller signal is lost this long, cut throttle and disarm. |
+
+The `ARMED_START_*` values only work with stick hold on. They stay until you move that stick.
+
+### Wind correction
+
+| Setting | Now | What it does |
+|---|---|---|
+| `CORRECTION_KP_US_PER_DECIDEG` | 0.8 | How hard it pushes back per degree of tilt. Raise it for a stronger correction, lower it if it overshoots. |
+| `CORRECTION_KD_US_PER_DPS` | 0.3 | How much it resists fast tilting. Raise it to damp wobble. |
+| `CORRECTION_MAX_US` | 100 | Most the correction can ever move a stick (safety limit) |
+| `CORRECTION_ATT_DEADBAND_DECIDEG` | 20 | Tilt under 2° is ignored |
+| `CORRECTION_RATE_DEADBAND_DPS` | 15 | Rotation under 15°/s is ignored |
+| `CORRECTION_STICK_DEADBAND_US` | 40 | If the pilot moves a stick more than this, the correction backs off that axis |
+| `CORRECTION_ALWAYS_ON` | 0 | **1:** correction always on, ignoring the controller button (bench testing only) |
+
+### Logging
+
+| Setting | Now | What it does |
+|---|---|---|
+| `SD_LOG_ENABLE` | 1 | **1:** write a CSV file to the SD card. **0:** no SD logging. |
+| `SD_LOG_EVERY_N_LOOPS` | 1 | 1 means a row every 20 ms (50 per second). 5 would be 10 per second (smaller files). |
+| `LOG_CSV_ENABLE` | 1 | **1:** also print CSV rows on the serial terminal (needs a laptop on J7) |
+| `LOG_CSV_EVERY_N_LOOPS` | 5 | Serial CSV every 5th loop (10 per second) |
+| `STATS_ENABLE` | 1 | **1:** print correction off-vs-on statistics on the serial terminal |
+| `STATS_PRINT_MS` | 5000 | How often the statistics print (ms) |
+| `STATUS_PRINT_EVERY_N_LOOPS` | 50 | How often the status lines print (50 = once a second) |
+
+### Battery and flight controller readings
+
+| Setting | Now | What it does |
+|---|---|---|
+| `FC_EXTRA_POLL_ENABLE` | 1 | **1:** read battery, armed state and received channels from the flight controller. **Needed for voltage/current logging.** |
+| `FC_EXTRA_POLL_EVERY_N_LOOPS` | 3 | How often to ask. Raise it if the loop starts running late. |
+| `BATT_CUTOFF_ENABLE` | 0 | **1:** force a disarm when the battery gets too low |
+| `BATT_CUTOFF_DECIV` | 0 | Low-battery cutoff in 0.1 V (e.g. 180 = 18.0 V). **Set it for your pack before turning the cutoff on.** |
+| `BATT_CUTOFF_READS` | 5 | Low readings in a row needed before it trips (avoids false trips from voltage dips) |
+
+### Controller setup (change only if the controller changes)
+
+| Setting | Now | What it does |
+|---|---|---|
+| `INPUT_SOURCE` | `INPUT_LORA` | Where pilot input comes from: `INPUT_LORA` (our controller), `INPUT_CRSF` (ExpressLRS radio), `INPUT_NONE` (bench only) |
+| `AXIS_LX_INVERT` | 1 | Flip yaw direction (set 1 if the drone yaws the wrong way) |
+| `AXIS_RX_INVERT` | 1 | Flip roll direction |
+| `AXIS_RY_INVERT` | 0 | Flip pitch direction |
+| `BTN_ARM_IS_L3` | 1 | **1:** button 1 = ARM, button 2 = correction. **0:** swapped. |
+| `THROTTLE_INTEGRATE` | 1 | **1:** throttle stick nudges throttle up/down and centre holds it. **0:** stick position = throttle. |
+
+### Bench-test switches (keep at 0 for flying!)
+
+| Setting | Now | What it does |
+|---|---|---|
+| `AUTO_ARM_AT_BOOT` | 0 | **1:** the board arms itself at startup. **Props off only.** |
+| `//#define FLIGHT_TEST_ENABLE` | off | Remove the `//` to run the automatic strapped-down thrust test |
+
+**Safety checks are built in.** If a setting is out of range (e.g. a start value the stick can't reach), the code **won't build** and tells you which setting to fix.
+
+---
+
+## What's new in detail
+
+### 1. The SD log has more columns
+
+Each power-up creates a new file (`LOG0001.CSV`, …) with one row every 20 ms. It opens straight in Excel.
+
+| Column | Meaning | How to read it |
+|---|---|---|
+| `t_ms` | Time since power-on | ms |
+| `thr_tx` | Throttle sent to the flight controller | 1000–2000 |
+| `arm_tx` | We told it to arm | 1 / 0 |
+| `fc_armed` | Flight controller says it's armed | 1 / 0 |
+| `link_ok` | Controller connected | 1 / 0 |
+| 🆕 `vbat_deci` | Battery voltage | 168 = 16.8 V |
+| 🆕 `amps_centi` | Current draw | 1250 = 12.50 A |
+| 🆕 `mah_drawn` | Battery used so far | mAh |
+| 🆕 `cmd_roll` / `cmd_pitch` / `cmd_yaw` | What the pilot is asking for | 0 = centre, ±500 = full stick |
+| 🆕 `tx_roll` / `tx_pitch` / `tx_yaw` | What we sent to the flight controller | 1500 = centre |
+| 🆕 `att_roll` / `att_pitch` | Drone's actual tilt | 50 = 5.0° |
+| 🆕 `att_yaw` | Drone's heading | degrees, 0–359 |
+
+**Good to know:**
+- **Battery values repeat for a few rows.** They update about 5 times a second.
+- **Current reads 0 unless Betaflight has a current sensor set up** (Power & Battery → Current Meter Source).
+- **Find the flight by `arm_tx`.** The file starts at power-on, so the flight is where `arm_tx` is 1.
+- **Correction data isn't in the SD log yet.** The correction's bias, the deviation from level and the on/off flag are still only on the serial terminal.
+
+### 2. Yaw in Live Expressions
+
+| | Roll | Pitch | Yaw |
+|---|---|---|---|
+| Pilot's command | `stickRawRollUs` | `stickRawPitchUs` | 🆕 `stickRawYawUs` |
+| Sent to the flight controller | `txRollDbg` | `txPitchDbg` | 🆕 `txYawDbg` |
+| Drone's actual angle | `attRoll` | `attPitch` | 🆕 `attYaw` |
+
+### 3. Starting roll/pitch/yaw when you arm
+
+1. Press ARM. Everything stays at rest for half a second.
+2. The throttle jumps to `THROTTLE_ARMED_START_US`, and roll/pitch/yaw jump to `ARMED_START_*`.
+3. They stay until you move that stick. Push the opposite way to return to centre.
+4. Disarming resets everything, and the values load again on the next arm.
+
+**Leave the start values at 1500 for wind tests.** The correction ignores an axis that isn't at centre.
+
+---
+
+## How to install
+
+1. Copy the three files into the project, replacing the old ones.
+2. In STM32CubeIDE, click the **CompanionBoard** project (not CompanionBoard_RegenSafe, which won't build).
+3. **Project → Clean**, then build.
+
+## Quick check (props off!)
+
+- [ ] Boot with an SD card. The serial terminal says `SD log: status=0`.
+- [ ] Arm. The throttle goes to 1200 after half a second.
+- [ ] Push a stick and let go. The value holds. Push the opposite way. It returns to centre.
+- [ ] Spin the motors gently. `fcVbatDeci` shows the battery voltage and `fcAmpsCenti` goes up.
+- [ ] Open the CSV on a computer. It has 17 columns with a row every 20 ms.
