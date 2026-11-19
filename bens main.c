@@ -33,17 +33,7 @@
   *   PART 5  CORRECTION    the wind-correction math and the off-vs-on statistics
   *   PART 6  MAIN PROGRAM  boot sequence, then the 50 Hz flight loop in order:
   *                         1 pilot input, 2 flight test, 3 failsafe, 4 sensors + baseline + correction,
-  *                         5 motor read-back, 6 send to FC, 7 logging, 8 loop timing (SD writes + serial output happen here)
-  *   PART 5B LOGGING       CSV row builder, SD card files (FatFs), serial header, markers (just before PART 6)
-  *
-  * LOGGING (one row per loop, same columns on the SD card and on the J7 serial "CSV," lines):
-  *   SD card : every loop (50 Hz). A new file starts on every arm/disarm and every correction toggle:
-  *             R001A_ON.CSV = run 1, Armed, correction ON;  R002GOFF.CSV = run 2, on the Ground, correction OFF.
-  *   Serial  : every LOG_CSV_EVERY_N_LOOPS loops, prefixed "CSV,". The column names are printed on "HDR," lines.
-  *   The first 16 columns are unchanged from the earlier firmware, so existing plotting scripts still work.
-  *   Markers : type 'm' in the serial terminal (adapter TX -> J7 pin 2), or set logMarker = 1 in Live Expressions.
-  *             The "marker" column counts up by one on the marked row.
-  *   Terminal keys: m = marker, n = start a new SD file, s = clear stats, z = re-zero baseline (disarmed only), ? = help
+  *                         5 motor read-back, 6 send to FC, 7 logging, 8 loop timing
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -57,6 +47,8 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <math.h>
+
+#include "sd_logger.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -118,36 +110,19 @@
 /* Debug output on the DEBUG UART (J7, USART6 TX, 115200 8N1) - plug a USB-serial adapter into J7 pin 3.
  * Plain UART output, so unlike semihosting it never hangs the MCU when no debugger is attached. */
 #define LOG_CSV_ENABLE            1   /* 1 = stream a CSV line for graphing */
-#define LOG_CSV_EVERY_N_LOOPS     5   /* 5 = 10 Hz on the serial port (115200 baud can't carry full 50 Hz rows). The SD card logs every loop */
-#define LOG_HEADER_EVERY_MS       30000 /* re-print the "HDR," column-name line this often, so a late-started capture still has it */
+#define LOG_CSV_EVERY_N_LOOPS     5
 #define STATS_ENABLE              1   /* 1 = print RMS/peak attitude deviation, correction OFF vs ON */
 #define STATS_PRINT_MS            5000
 #define STATUS_PRINT_EVERY_N_LOOPS 50
-#define DBG_TX_BUFFER_SIZE        4096 /* serial output is queued here and sent while the loop waits, so printing never stalls the loop */
-#define DBG_RX_COMMANDS_ENABLE    1   /* 1 = keys typed in the terminal are commands (needs the adapter's TX wired to J7 pin 2) */
-
-/* SD card log (SPI2, FatFs). Needs FATFS enabled in the .ioc as "User-defined" - see the setup notes. */
-#define LOG_SD_ENABLE             1   /* 1 = write CSV files to the SD card */
-#define LOG_SD_EVERY_N_LOOPS      1   /* 1 = every loop (50 Hz) */
-#define LOG_SD_NEW_FILE_ON_ARM    1   /* 1 = new file on every arm and disarm */
-#define LOG_SD_NEW_FILE_ON_CORR   1   /* 1 = new file whenever correction is toggled (so ON and OFF land in separate files) */
-#define LOG_SD_SYNC_MS            2000 /* commit to the card this often, so a crash or battery pull loses at most ~2 s */
-#define LOG_SD_BUFFER_SIZE        8192 /* RAM buffer for rows waiting to be written. Must be a multiple of 512 */
-#define LOG_SD_MAX_SECTORS_PER_LOOP 2  /* at most this many 512-byte writes per loop, to keep the loop on time */
-#define LOG_SD_RETRY_MS           5000 /* after an SD error, retry mounting this often (only while disarmed) */
-#define SD_CD_PORT                GPIOB
-#define SD_CD_PIN                 GPIO_PIN_10 /* card-detect switch */
-#define SD_CD_PRESENT_LEVEL       GPIO_PIN_RESET /* level that means "card inserted" (switch to GND = RESET) */
-#define SD_CD_REQUIRED            0   /* 1 = don't try to mount unless card-detect says a card is in. 0 = always try (detect is only reported) */
-#if (LOG_SD_BUFFER_SIZE % 512) != 0
-#error LOG_SD_BUFFER_SIZE must be a multiple of 512
-#endif
 
 #if INPUT_SOURCE == INPUT_CRSF
 #define DEBUG_UART_ENABLE         0   /* USART6 is busy receiving CRSF at 420000 baud */
 #else
 #define DEBUG_UART_ENABLE         1
 #endif
+
+#define SD_LOG_ENABLE             1   /* 1 = log to the SD card */
+#define SD_LOG_EVERY_N_LOOPS      1   /* 1 = a row every loop (50 Hz) */
 
 
 /* >>>>>> 1B. RECEIVER SETTINGS: radio, packet layout, sticks and buttons  <<<<<< */
@@ -193,20 +168,41 @@
 #define AXIS_RAW_MIN              (-100)       /* value with the stick fully one way  */
 #define AXIS_RAW_CENTER           0            /* value with the stick released       */
 #define AXIS_RAW_MAX              100          /* value with the stick fully the other way */
-#define AXIS_LX_INVERT            0            /* flip direction: set 1 if the drone moves the wrong way (check stickUs[] / Betaflight Receiver tab) */
+#define AXIS_LX_INVERT            1            /* YAW inverted (left stick left/right). flip direction: set 1 if the drone moves the wrong way (check stickUs[] / Betaflight Receiver tab) */
 #define AXIS_LY_INVERT            0
-#define AXIS_RX_INVERT            0
+#define AXIS_RX_INVERT            1            /* ROLL inverted (right stick left/right) */
 #define AXIS_RY_INVERT            0
 #define STICK_DEADBAND_US         25           /* ignore tiny stick offsets (stick drift) */
 
 /* Stick scaling: how much of the full +/-500 us range a full stick deflection sends to the FC.
- * 100 = full range (old behaviour). 30 = full stick sends +/-150 us, for small, controlled movements.
+ * 100 = full range. 30 = full stick sends +/-150 us (1350..1650), for small, controlled movements.
  * Applies to every pilot input source (LoRa or CRSF). Throttle is not scaled (it has THROTTLE_MAX_US).
  * The correction still decides "is the pilot using this axis?" from the stick BEFORE scaling,
  * so CORRECTION_STICK_DEADBAND_US keeps meaning the same physical stick movement at any scale. */
 #define STICK_SCALE_ROLL_PCT      30
 #define STICK_SCALE_PITCH_PCT     30
-#define STICK_SCALE_YAW_PCT       50
+#define STICK_SCALE_YAW_PCT       30
+/* Stick hold: when 1, letting a stick spring back to centre keeps the last push instead of returning to 0.
+ *   - Each push sets that axis to the FURTHEST point reached during the push (so the spring-back on release
+ *     doesn't change it). Pushing harder raises it; a new push in the same direction replaces it.
+ *   - A push in the OPPOSITE direction clears the axis back to centre (0). Push again to set a new value.
+ *   - Pushes smaller than STICK_HOLD_MIN_PUSH_US are ignored, so stick jitter and the overshoot when the stick
+ *     snaps back can't set or clear anything.
+ *   - Holds only apply while armed, and are cleared on disarm and on link loss. While disarmed the sticks
+ *     pass through live (so the Betaflight Receiver tab still shows them).
+ *   - An axis with a held value counts as "pilot is using this axis", so the correction leaves it alone.
+ *   - LoRa controller only (a CRSF radio has its own sticks/trims).
+ * Careful: a held roll/pitch in ANGLE mode is a held tilt, so the drone keeps drifting that way.
+ * A held yaw is a constant spin rate in every flight mode. */
+#define STICK_HOLD_ENABLE         1            /* 1 = hold mode on, 0 = sticks return to centre (normal) */
+#define STICK_HOLD_ROLL           1            /* per-axis: which axes hold when STICK_HOLD_ENABLE is 1 */
+#define STICK_HOLD_PITCH          1
+#define STICK_HOLD_YAW            1
+#define STICK_HOLD_MIN_PUSH_US    100          /* a push must reach this far (us, before scaling; 500 = full stick) to count */
+
+#if STICK_SCALE_ROLL_PCT < 0 || STICK_SCALE_ROLL_PCT > 100 || STICK_SCALE_PITCH_PCT < 0 || STICK_SCALE_PITCH_PCT > 100 || STICK_SCALE_YAW_PCT < 0 || STICK_SCALE_YAW_PCT > 100
+#error STICK_SCALE_*_PCT must be 0..100
+#endif
 
 /* Buttons (called L3 / R3 in this file). Button 1 = L3, button 2 = R3. */
 #define BTN_BYTE_OFF              7            /* byte holding the button bits */
@@ -226,11 +222,10 @@ enum { AX_LX = 0, AX_LY = 1, AX_RX = 2, AX_RY = 3 };
  * THROTTLE_INTEGRATE 1: pushing the stick up raises throttle, pulling down lowers it, centre holds it (like a trigger).
  * THROTTLE_INTEGRATE 0: the stick position IS the throttle (use only if the throttle axis does not spring back). */
 #define THROTTLE_INTEGRATE        1
-#define THROTTLE_RATE_US_PER_SEC  100          /* full stick deflection changes throttle by this many us per second.
-                                                * Hover ~1400 and climb ~1450 are only 50 us apart, so keep this slow */
-#define THROTTLE_MAX_US           1550         /* hard cap on throttle from the controller (hover ~1400, climb ~1450 + margin) */
-#define THROTTLE_ARMED_START_US   1200         /* after arming, throttle jumps here (below hover, so it stays on the ground)
-                                                * so the stick works in the useful range. 1000 = old behaviour (start from idle) */
+#define THROTTLE_RATE_US_PER_SEC  75          /* full stick deflection changes throttle by this many us per second */
+#define THROTTLE_MAX_US           1500         /* hard cap on throttle from the controller. Raise slowly during testing */
+#define THROTTLE_ARMED_START_US   1200         /* after arming, throttle jumps here so the stick works in the useful range.
+                                                * Keep it below hover so the drone stays on the ground. 1000 = start from idle */
 #define THROTTLE_ARM_HOLD_MS      500          /* throttle is held at 1000 this long after the ARM press, because Betaflight
                                                 * refuses to arm while throttle is above min_check (default 1050) */
 #if THROTTLE_ARMED_START_US >= THROTTLE_MAX_US || THROTTLE_MAX_US > 2000 || THROTTLE_ARMED_START_US < 1000
@@ -247,6 +242,18 @@ enum { AX_LX = 0, AX_LY = 1, AX_RX = 2, AX_RY = 3 };
 #define MSP_ATTITUDE              108
 #define MSP_SET_RAW_RC            200
 #define MSP_SET_ARMING_DISABLED   239
+#define MSP_RC                    105
+#define MSP_ANALOG                110
+
+/* ---- Extra FC readings: armed state (MSP_STATUS), the channels the FC received (MSP_RC), battery (MSP_ANALOG) ---- */
+#define FC_EXTRA_POLL_ENABLE        1    /* 1 = read these three from the FC; 0 = switch them off */
+#define FC_EXTRA_POLL_EVERY_N_LOOPS 3    /* one extra MSP request every N loops (20 ms each), cycling STATUS -> RC -> ANALOG, so each is
+                                          * refreshed every 3*N loops (180 ms at N=3). Each request costs a few ms on the 115200 baud link:
+                                          * watch loopWorkMsMax and loopOverrunCount, and raise N if the loop starts overrunning */
+#define FC_RC_ECHO_TOLERANCE_US     3    /* the FC's echo of a channel may differ from what we sent by this much before it counts as a mismatch */
+#define BATT_CUTOFF_ENABLE          0    /* 1 = force disarm and minimum throttle when the battery stays below BATT_CUTOFF_DECIV */
+#define BATT_CUTOFF_DECIV           0    /* cutoff in 0.1 V units (180 = 18.0 V). Set it for your pack BEFORE enabling; 0 = never trips */
+#define BATT_CUTOFF_READS           5    /* consecutive low readings needed before it trips (each reading is ~180 ms apart) */
 #define RC_CHANNEL_COUNT          8
 
 #define CRSF_SYNC_BYTE            0xC8
@@ -275,9 +282,6 @@ enum { AX_LX = 0, AX_LY = 1, AX_RX = 2, AX_RY = 3 };
 #define GYRO_FILTER_PCT                 30   /* gyro low-pass (lower = smoother) */
 #define CORRECTION_MAX_US             100    /* correction can move a stick at most +/-100 us */
 #define CORRECTION_STICK_DEADBAND_US  40     /* pilot stick beyond +/-40 us of centre = pilot owns that axis (measured before STICK_SCALE) */
-#if STICK_SCALE_ROLL_PCT < 0 || STICK_SCALE_ROLL_PCT > 100 || STICK_SCALE_PITCH_PCT < 0 || STICK_SCALE_PITCH_PCT > 100 || STICK_SCALE_YAW_PCT < 0 || STICK_SCALE_YAW_PCT > 100
-#error STICK_SCALE_*_PCT must be 0..100
-#endif
 /* Sign conventions verified on the bench: tilt right -> roll bias negative, nose up -> pitch bias positive */
 #define CORRECTION_ROLL_SIGN          (-1)
 #define CORRECTION_PITCH_SIGN         (-1)
@@ -341,6 +345,7 @@ volatile int16_t  deltaRoll = 0, deltaPitch = 0;
 volatile int16_t  gyroRoll = 0, gyroPitch = 0;
 volatile int16_t  attRoll = 0, attPitch = 0;          /* live attitude, decidegrees */
 volatile int16_t  baseRollDbg = 0, basePitchDbg = 0;  /* locked baseline, decidegrees */
+volatile int16_t  stickRawRollUs = 0, stickRawPitchUs = 0;  /* pilot roll/pitch offsets from centre BEFORE stick scaling, -500..+500 */
 volatile uint8_t  rezeroBaseline = 0;                 /* set to 1 to re-capture the level baseline (hold flat and still) */
 volatile uint8_t  statsReset = 0;                     /* set to 1 to clear the OFF/ON attitude statistics */
 volatile uint16_t motorOut[4] = {0, 0, 0, 0};         /* motor outputs the FC is commanding, 1000-2000 */
@@ -384,32 +389,26 @@ volatile uint16_t loopWorkMsMax = 0;     /* worst loop since baseline lock */
 volatile uint32_t loopOverrunCount = 0;  /* loops whose work exceeded LOOP_PERIOD_MS */
 volatile uint32_t loopWorkSumMs = 0;     /* sum of work times since baseline lock */
 volatile uint32_t loopWorkN = 0;         /* loops counted since baseline lock */
-volatile uint16_t loopPeriodMsMax = 0;   /* longest time between loop starts since baseline lock (includes SD writes) */
 
-/* Logging */
-volatile uint8_t  logMarker = 0;          /* set to 1 (Live Expressions or 'm' key) to mark an event, e.g. fan switched on */
-volatile uint8_t  logNewFile = 0;         /* set to 1 (or 'n' key) to close the SD file and start a new one */
-volatile uint32_t markerCount = 0;        /* markers so far; the CSV "marker" column */
-volatile uint8_t  distActive = 0;         /* 1 while roll or pitch is more than ATTITUDE_DISTURBANCE_THRESHOLD_DECIDEG off level */
-volatile uint32_t distEventCount = 0;     /* times distActive went 0 -> 1 */
-volatile uint16_t pilotRollDbg = 1500, pilotPitchDbg = 1500;  /* pilot sticks before the correction bias (after STICK_SCALE) */
-volatile int16_t  stickRawRollUs = 0, stickRawPitchUs = 0;    /* pilot stick offsets from centre BEFORE scaling, -500..+500 */
-volatile uint16_t pilotPktAgeMs = 0xFFFF; /* ms since the last valid controller packet (65535 = never) */
-volatile uint8_t  failsafeActive = 0;     /* 1 = link lost, throttle cut and disarmed */
-volatile uint16_t loraLastSeq = 0;        /* 16-bit sequence number of the last good packet */
-volatile uint32_t dbgDropCount = 0;       /* serial lines dropped because the output buffer was full */
-volatile uint8_t  dbgRezeroRequest = 0;   /* 'z' key: re-zero, but only while disarmed */
+/* Extra FC readings (MSP_STATUS / MSP_RC / MSP_ANALOG): add these to Live Expressions */
+volatile uint8_t  fcArmed = 0;                        /* the FC's own armed state (MSP_STATUS flight-mode bit 0) */
+volatile uint16_t fcCycleTimeUs = 0;                  /* the FC's PID loop time in microseconds */
+volatile uint16_t fcSensors = 0;                      /* MSP_STATUS sensor-present bits */
+volatile uint32_t fcModeFlags = 0;                    /* MSP_STATUS flight-mode flags */
+volatile uint16_t fcRc[RC_CHANNEL_COUNT] = {0};       /* the channels the FC says it received (MSP_RC) */
+volatile uint32_t fcRcMismatchCount = 0;              /* echoes that did not match what we last sent */
+volatile uint16_t fcVbatDeci = 0;                     /* battery voltage in 0.1 V (MSP_ANALOG) */
+volatile uint16_t fcMahDrawn = 0;                     /* mAh drawn */
+volatile int16_t  fcAmpsCenti = 0;                    /* current in 0.01 A (0 unless the FC has a current sensor set up) */
+volatile uint32_t fcStatusOkCount = 0, fcStatusFailCount = 0;
+volatile uint32_t fcRcOkCount = 0,     fcRcFailCount = 0;
+volatile uint32_t fcAnalogOkCount = 0, fcAnalogFailCount = 0;
+volatile uint8_t  battLowLatched = 0;                 /* 1 = the battery cutoff has tripped (clears only on reset) */
+static uint16_t   lastSentRc[RC_CHANNEL_COUNT];       /* what we sent to the FC last loop, for the MSP_RC comparison */
+static uint8_t    lastSentRcValid = 0;
 
-/* SD card */
-typedef enum { SD_OFF = 0, SD_READY, SD_LOGGING, SD_FAILED } SdState;
-volatile SdState  sdState = SD_OFF;       /* 0 off/no card, 1 mounted, 2 writing a file, 3 error (retries while disarmed) */
-volatile uint8_t  sdCardPresent = 0;      /* card-detect switch reading */
-volatile uint32_t sdRowCount = 0;         /* rows written to the current file */
-volatile uint32_t sdDropRows = 0;         /* rows lost because the RAM buffer was full (card too slow) */
-volatile uint32_t sdErrCount = 0;         /* SD errors since boot */
-volatile int      sdLastFres = 0;         /* last FatFs error code (FRESULT) */
-volatile uint16_t sdServiceMsMax = 0;     /* longest time spent writing to the card in one loop */
-char              sdFileName[16] = "-";   /* current file, 8.3 name */
+static log_record_t g_log;
+volatile logger_status_t sdLogStatus = LOG_ERR_NO_CARD;
 
 /* USER CODE END PV */
 
@@ -434,112 +433,23 @@ static void MX_SPI2_Init(void);
 /* ---------------------------------------------------------------------------
  * Debug output on USART6 TX (J7). No-op when the debug UART is disabled.
  * ------------------------------------------------------------------------- */
-/* Output is queued in a ring buffer and fed to the UART a byte at a time by dbg_pump(), which the main loop calls
- * while it waits out the rest of each 20 ms period. Before the main loop starts (boot messages) every print is
- * flushed straight away. If the buffer is full inside the loop, the line is dropped and dbgDropCount goes up
- * instead of stalling the flight loop. */
-#if DEBUG_UART_ENABLE
-static char dbgTxBuf[DBG_TX_BUFFER_SIZE];
-static volatile uint16_t dbgHead = 0, dbgTail = 0;
-static uint8_t dbgBlocking = 1;          /* 1 until the main loop starts */
-
-static uint16_t dbg_used(void)
-{
-  return (uint16_t)((dbgHead + DBG_TX_BUFFER_SIZE - dbgTail) % DBG_TX_BUFFER_SIZE);
-}
-
-static void dbg_handle_key(uint8_t c);
-
-/* Moves queued bytes into the UART while it has room, and reads any typed command key. Never blocks. */
-static void dbg_pump(void)
-{
-  USART_TypeDef *u = huart6.Instance;
-  uint32_t sr = u->SR;
-
-  if (sr & (USART_SR_RXNE | USART_SR_ORE | USART_SR_FE | USART_SR_NE))
-  {
-    uint8_t c = (uint8_t)u->DR;             /* reading SR then DR also clears the error flags */
-    if (!(sr & (USART_SR_FE | USART_SR_NE)) && (sr & USART_SR_RXNE)) dbg_handle_key(c);
-  }
-
-  while (dbgTail != dbgHead && (u->SR & USART_SR_TXE))
-  {
-    u->DR = (uint8_t)dbgTxBuf[dbgTail];
-    dbgTail = (uint16_t)((dbgTail + 1) % DBG_TX_BUFFER_SIZE);
-  }
-}
-
-static void dbg_flush(uint32_t timeout_ms)
-{
-  uint32_t t0 = HAL_GetTick();
-  while (dbgTail != dbgHead && (HAL_GetTick() - t0) < timeout_ms) dbg_pump();
-}
-
-static void dbg_write(const char *s, uint16_t n)
-{
-  uint16_t freeBytes = (uint16_t)(DBG_TX_BUFFER_SIZE - 1 - dbg_used());
-  if (n > freeBytes)
-  {
-    if (dbgBlocking) { dbg_flush(500); freeBytes = (uint16_t)(DBG_TX_BUFFER_SIZE - 1 - dbg_used()); }
-    if (n > freeBytes) { dbgDropCount++; return; }
-  }
-  for (uint16_t i = 0; i < n; i++)
-  {
-    dbgTxBuf[dbgHead] = s[i];
-    dbgHead = (uint16_t)((dbgHead + 1) % DBG_TX_BUFFER_SIZE);
-  }
-  if (dbgBlocking) dbg_flush(500);
-}
-#else
-static void dbg_pump(void) { }
-static void dbg_write(const char *s, uint16_t n) { (void)s; (void)n; }
-#endif
-
 static void dbg_printf(const char *fmt, ...)
 {
 #if DEBUG_UART_ENABLE
-  char buf[320];
+  char buf[200];
   va_list ap;
   va_start(ap, fmt);
   int n = vsnprintf(buf, sizeof(buf), fmt, ap);
   va_end(ap);
   if (n > 0)
   {
-    if (n >= (int)sizeof(buf))
-    {
-      /* too long: keep what fits but always end the line, so log parsers never see two lines glued together */
-      n = (int)sizeof(buf) - 1;
-      buf[n - 2] = '\r';
-      buf[n - 1] = '\n';
-    }
-    dbg_write(buf, (uint16_t)n);
+    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
+    HAL_UART_Transmit(&huart6, (uint8_t *)buf, (uint16_t)n, 50);
   }
 #else
   (void)fmt;
 #endif
 }
-
-#if DEBUG_UART_ENABLE
-/* Keys typed into the serial terminal (adapter TX -> J7 pin 2). Ignored if DBG_RX_COMMANDS_ENABLE is 0. */
-static void dbg_handle_key(uint8_t c)
-{
-#if DBG_RX_COMMANDS_ENABLE
-  switch (c)
-  {
-    case 'm': case 'M': logMarker = 1;        break;
-    case 'n': case 'N': logNewFile = 1;       break;
-    case 's': case 'S': statsReset = 1;       break;
-    case 'z': case 'Z': dbgRezeroRequest = 1; break;
-    case '?': case 'h': case 'H':
-      dbg_printf("KEYS: m = marker, n = new SD file, s = clear stats, z = re-zero baseline (disarmed only)\r\n");
-      break;
-    default: break;
-  }
-#else
-  (void)c;
-#endif
-}
-#endif
 
 
 /* ##########################################################################################
@@ -705,6 +615,59 @@ static HAL_StatusTypeDef msp_get_motors(UART_HandleTypeDef *huart, uint16_t *out
     out4[i] = (uint16_t)(resp.payload[i * 2] | (resp.payload[i * 2 + 1] << 8));
   }
 
+  return HAL_OK;
+}
+
+/* MSP_STATUS: loop time, sensors and the flight-mode flags. Bit 0 of the flags is ARM (the FC's own armed state). */
+static HAL_StatusTypeDef msp_get_status(UART_HandleTypeDef *huart, uint16_t *cycleUs, uint16_t *sensors, uint32_t *modeFlags)
+{
+  MspResponse resp;
+
+  msp_flush_rx(huart);
+  msp_send_request(huart, MSP_STATUS, NULL, 0);
+
+  if (msp_read_response(huart, &resp, 100) != HAL_OK) return HAL_ERROR;
+  if (resp.direction != '>' || resp.cmd != MSP_STATUS || resp.size < 10) return HAL_ERROR;
+
+  *cycleUs   = (uint16_t)(resp.payload[0] | (resp.payload[1] << 8));
+  *sensors   = (uint16_t)(resp.payload[4] | (resp.payload[5] << 8));
+  *modeFlags = (uint32_t)resp.payload[6] | ((uint32_t)resp.payload[7] << 8) |
+               ((uint32_t)resp.payload[8] << 16) | ((uint32_t)resp.payload[9] << 24);
+  return HAL_OK;
+}
+
+/* MSP_RC: the channel values the FC currently holds (uint16 each). We keep the first RC_CHANNEL_COUNT. */
+static HAL_StatusTypeDef msp_get_rc(UART_HandleTypeDef *huart, uint16_t *out)
+{
+  MspResponse resp;
+
+  msp_flush_rx(huart);
+  msp_send_request(huart, MSP_RC, NULL, 0);
+
+  if (msp_read_response(huart, &resp, 100) != HAL_OK) return HAL_ERROR;
+  if (resp.direction != '>' || resp.cmd != MSP_RC || resp.size < (RC_CHANNEL_COUNT * 2)) return HAL_ERROR;
+
+  for (uint8_t i = 0; i < RC_CHANNEL_COUNT; i++)
+  {
+    out[i] = (uint16_t)(resp.payload[i * 2] | (resp.payload[i * 2 + 1] << 8));
+  }
+  return HAL_OK;
+}
+
+/* MSP_ANALOG: battery voltage (uint8, 0.1 V), mAh drawn (uint16), RSSI (uint16), current (int16, 0.01 A) */
+static HAL_StatusTypeDef msp_get_analog(UART_HandleTypeDef *huart, uint16_t *vbatDeci, uint16_t *mAh, int16_t *ampsCenti)
+{
+  MspResponse resp;
+
+  msp_flush_rx(huart);
+  msp_send_request(huart, MSP_ANALOG, NULL, 0);
+
+  if (msp_read_response(huart, &resp, 100) != HAL_OK) return HAL_ERROR;
+  if (resp.direction != '>' || resp.cmd != MSP_ANALOG || resp.size < 7) return HAL_ERROR;
+
+  *vbatDeci  = resp.payload[0];
+  *mAh       = (uint16_t)(resp.payload[1] | (resp.payload[2] << 8));
+  *ampsCenti = (int16_t)(resp.payload[5] | (resp.payload[6] << 8));
   return HAL_OK;
 }
 
@@ -883,7 +846,56 @@ static HAL_StatusTypeDef lora_init(void)
 
 volatile uint8_t  armLatched = 0;         /* ARM state toggled by the controller button */
 volatile uint8_t  corrLatched = 0;        /* correction state toggled by the controller button */
-volatile int16_t  stickUs[4] = {0, 0, 0, 0};   /* decoded stick offsets, -500..+500: LX, LY, RX, RY */
+volatile int16_t  stickUs[4] = {0, 0, 0, 0};   /* decoded stick offsets, -500..+500: LX, LY, RX, RY (live, before any hold) */
+volatile int16_t  stickHeldUs[4] = {0, 0, 0, 0}; /* STICK_HOLD: value each axis is holding, -500..+500 (0 = centred) */
+
+#if STICK_HOLD_ENABLE
+/* One axis of stick hold. live = this packet's stick (-500..+500), returns the value to send. */
+static int16_t stick_hold_axis(uint8_t axis, int16_t live)
+{
+  static uint8_t pushActive[4] = {0, 0, 0, 0};
+  static int8_t  pushDir[4]    = {0, 0, 0, 0};   /* +1 / -1 = setting a value, 0 = this push is a "clear" push */
+  int16_t held = stickHeldUs[axis];
+  int16_t mag  = (int16_t)(live < 0 ? -live : live);
+
+  if (mag < STICK_HOLD_MIN_PUSH_US)
+  {
+    pushActive[axis] = 0;                        /* stick (nearly) centred: keep whatever is held */
+    return held;
+  }
+
+  int8_t dir = (live > 0) ? 1 : -1;
+  if (!pushActive[axis])
+  {
+    /* A new push. Opposite to the held value = clear; otherwise it starts a new held value. */
+    pushActive[axis] = 1;
+    if (held != 0 && dir != ((held > 0) ? 1 : -1))
+    {
+      pushDir[axis] = 0;
+      held = 0;
+    }
+    else
+    {
+      pushDir[axis] = dir;
+      held = live;
+    }
+  }
+  else if (pushDir[axis] == dir)
+  {
+    /* Same push, same direction: keep the furthest point reached */
+    if (mag > (held < 0 ? -held : held)) held = live;
+  }
+  /* (a clear push, or a swing past centre without releasing, changes nothing more) */
+
+  stickHeldUs[axis] = held;
+  return held;
+}
+
+static void stick_hold_clear(void)
+{
+  for (uint8_t i = 0; i < 4; i++) stickHeldUs[i] = 0;
+}
+#endif
 
 static int32_t pkt_u(const uint8_t *buf, uint8_t off)
 {
@@ -974,7 +986,7 @@ static void lora_decode_packet(const uint8_t *buf, PilotFrame *frame)
   }
   else if (!armStartDone)
   {
-    thr = THROTTLE_ARMED_START_US; /* jump once to just below hover; the stick takes it from here */
+    thr = THROTTLE_ARMED_START_US; /* jump once to the start value; the stick takes it from here */
     armStartDone = 1;
   }
   else
@@ -989,10 +1001,32 @@ static void lora_decode_packet(const uint8_t *buf, PilotFrame *frame)
     thr = (uint16_t)t;
   }
 
-  frame->ch[0] = (uint16_t)(1500 + stickUs[MAP_ROLL_AXIS]);
-  frame->ch[1] = (uint16_t)(1500 + stickUs[MAP_PITCH_AXIS]);
+  int16_t rollUs  = stickUs[MAP_ROLL_AXIS];
+  int16_t pitchUs = stickUs[MAP_PITCH_AXIS];
+  int16_t yawUs   = stickUs[MAP_YAW_AXIS];
+#if STICK_HOLD_ENABLE
+  if (!armLatched)
+  {
+    stick_hold_clear();           /* disarmed (or link was lost): no holds, sticks pass through live */
+  }
+  else
+  {
+#if STICK_HOLD_ROLL
+    rollUs  = stick_hold_axis(MAP_ROLL_AXIS,  rollUs);
+#endif
+#if STICK_HOLD_PITCH
+    pitchUs = stick_hold_axis(MAP_PITCH_AXIS, pitchUs);
+#endif
+#if STICK_HOLD_YAW
+    yawUs   = stick_hold_axis(MAP_YAW_AXIS,   yawUs);
+#endif
+  }
+#endif
+
+  frame->ch[0] = (uint16_t)(1500 + rollUs);
+  frame->ch[1] = (uint16_t)(1500 + pitchUs);
   frame->ch[2] = thr;
-  frame->ch[3] = (uint16_t)(1500 + stickUs[MAP_YAW_AXIS]);
+  frame->ch[3] = (uint16_t)(1500 + yawUs);
   frame->ch[4] = armLatched  ? 2000 : 1000;    /* AUX1 = ARM */
   frame->ch[5] = corrLatched ? 2000 : 1000;    /* AUX2 = correction toggle */
   frame->ch[6] = 1000;                         /* AUX3 */
@@ -1042,7 +1076,6 @@ static HAL_StatusTypeDef pilot_lora_poll(PilotFrame *frame)
     }
     lastSeq = buf[PKT_SEQ_OFF];
     haveSeq = 1;
-    loraLastSeq = (uint16_t)(buf[PKT_SEQ_OFF] | (buf[PKT_SEQ_OFF + 1] << 8));   /* full 16-bit number, for the log */
   }
 #endif
 
@@ -1213,316 +1246,6 @@ static void stats_print(void)
              (unsigned long)statsOn.n, (long)stats_rms(statsOn.sumSqRoll, statsOn.n), (long)stats_rms(statsOn.sumSqPitch, statsOn.n),
              statsOn.peakRoll, statsOn.peakPitch);
 }
-
-
-/* ##########################################################################################
- *  PART 5B  -  LOGGING
- *  One CSV row per loop with everything needed to measure peak deviation and recovery time, prove what the
- *  correction did, and check link health. The same row goes to the SD card (every loop) and the serial port.
- ########################################################################################## */
-
-/* Column names. The first 16 are the same as the earlier firmware's CSV line. Units:
- *   att / delta / base       0.1 deg  (delta = att - base, the deviation from the locked level baseline)
- *   gyro                     deg/s (low-pass filtered, the value the correction uses)
- *   bias                     us added to the roll/pitch stick by the correction
- *   corr                     1 = correction active        thr, arm   us sent to the FC (arm 2000 = armed)
- *   m1..m4                   motor outputs the FC is commanding, us
- *   pilotRoll/Pitch          stick from the pilot, us, BEFORE the bias    outRoll/Pitch  what was sent, AFTER the bias
- *   link                     1 = controller link alive    seq  last LoRa sequence number    pktAgeMs  ms since last packet
- *   failsafe                 1 = link lost, throttle cut and disarmed
- *   loraPkts/Lost/Bad, rssi  running packet counts, last RSSI in dBm
- *   mspOk, attFail...        running count of good FC replies, failed attitude/gyro/motor reads
- *   loopMs, overruns         previous loop's work time in ms, running count of loops over 20 ms
- *   dist, distEvents         1 while |delta| > ATTITUDE_DISTURBANCE_THRESHOLD_DECIDEG, running count of disturbances
- *   marker                   running count of markers ('m' key / logMarker); it goes up by one on the marked row */
-#define LOG_HEADER "t_ms,attRoll,attPitch,deltaRoll,deltaPitch,gyroRoll,gyroPitch,biasRoll,biasPitch,corr,thr,arm,m1,m2,m3,m4," \
-                   "baseRoll,basePitch,pilotRoll,pilotPitch,outRoll,outPitch,link,seq,pktAgeMs,failsafe," \
-                   "loraPkts,loraLost,loraBad,rssi,mspOk,attFail,gyroFail,motFail,loopMs,overruns,dist,distEvents,marker"
-
-static int log_format_row(char *buf, size_t size)
-{
-  int n = snprintf(buf, size,
-      "%lu,%d,%d,%d,%d,%d,%d,%d,%d,%u,%u,%u,%u,%u,%u,%u,"
-      "%d,%d,%u,%u,%u,%u,%u,%u,%u,%u,"
-      "%lu,%lu,%lu,%d,%lu,%lu,%lu,%lu,%u,%lu,%u,%lu,%lu\r\n",
-      (unsigned long)HAL_GetTick(), attRoll, attPitch, deltaRoll, deltaPitch,
-      gyroRoll, gyroPitch, biasRoll, biasPitch, (unsigned)correctionActive,
-      (unsigned)txThrottleDbg, (unsigned)txArmDbg,
-      (unsigned)motorOut[0], (unsigned)motorOut[1], (unsigned)motorOut[2], (unsigned)motorOut[3],
-      baseRollDbg, basePitchDbg, (unsigned)pilotRollDbg, (unsigned)pilotPitchDbg,
-      (unsigned)txRollDbg, (unsigned)txPitchDbg, (unsigned)pilotLinkAlive, (unsigned)loraLastSeq,
-      (unsigned)pilotPktAgeMs, (unsigned)failsafeActive,
-      (unsigned long)loraPktCount, (unsigned long)loraLostCount, (unsigned long)loraCrcErrCount, (int)loraRssiDbm,
-      (unsigned long)mspReplyOkCount, (unsigned long)attitudeFailCount, (unsigned long)gyroFailCount,
-      (unsigned long)motorFailCount, (unsigned)loopWorkMs, (unsigned long)loopOverrunCount,
-      (unsigned)distActive, (unsigned long)distEventCount, (unsigned long)markerCount);
-
-  if (n < 0) return 0;
-  if (n >= (int)size)   /* never happens with a 300+ byte buffer, but keep the line ending intact if it does */
-  {
-    n = (int)size - 1;
-    buf[n - 2] = '\r';
-    buf[n - 1] = '\n';
-  }
-  return n;
-}
-
-static void log_print_header_serial(void)
-{
-  static const char hdr[] = "HDR," LOG_HEADER "\r\n";
-  dbg_write(hdr, (uint16_t)(sizeof(hdr) - 1));
-}
-
-static const char *sd_state_name(void)
-{
-  switch (sdState)
-  {
-    case SD_READY:   return "ready";
-    case SD_LOGGING: return "logging";
-    case SD_FAILED:  return "error";
-    default:         return "off";
-  }
-}
-
-#if LOG_SD_ENABLE
-/* ---------------------------------------------------------------------------
- * SD card files. Rows are copied into a RAM ring buffer (fast), and sd_service() writes whole 512-byte
- * sectors to the card at the end of each loop, at most LOG_SD_MAX_SECTORS_PER_LOOP per loop.
- * The file is committed (f_sync) every LOG_SD_SYNC_MS, so a crash loses at most that much.
- * ------------------------------------------------------------------------- */
-extern Diskio_drvTypeDef USER_Driver;
-
-static FIL      sdFile;
-static uint8_t  sdBuf[LOG_SD_BUFFER_SIZE] __attribute__((aligned(4)));
-static uint32_t sdHead = 0, sdTail = 0, sdUsed = 0;
-static uint16_t sdRunNumber = 0;          /* last run number used; the next file is sdRunNumber + 1 */
-static uint32_t sdLastSyncTick = 0, sdLastRetryTick = 0;
-static uint8_t  sdFileArmed = 0, sdFileCorr = 0;
-
-static uint8_t sd_card_detect(void)
-{
-  return (HAL_GPIO_ReadPin(SD_CD_PORT, SD_CD_PIN) == SD_CD_PRESENT_LEVEL) ? 1 : 0;
-}
-
-/* Any card error: stop SD logging without touching the card again (a dead card can make each access time out),
- * and let sd_service() try to mount again while disarmed. Data already synced to the card is safe. */
-static void sd_fail(const char *what, FRESULT fr)
-{
-  sdErrCount++;
-  sdLastFres = (int)fr;
-  dbg_printf("SD: %s failed (FatFs error %d) - SD logging stopped, will retry while disarmed\r\n", what, (int)fr);
-  f_mount(NULL, USERPath, 0);
-  sdState = SD_FAILED;
-  sdHead = sdTail = sdUsed = 0;
-  strcpy(sdFileName, "-");
-  sdLastRetryTick = HAL_GetTick();
-}
-
-/* Finds the highest Rnnn... file number already on the card so new runs never overwrite old ones */
-static void sd_scan_run_number(void)
-{
-  DIR dir;
-  FILINFO fi;
-  uint16_t maxN = 0;
-
-  if (f_opendir(&dir, USERPath) != FR_OK) return;
-  for (;;)
-  {
-    if (f_readdir(&dir, &fi) != FR_OK || fi.fname[0] == 0) break;
-    if (fi.fname[0] == 'R' &&
-        fi.fname[1] >= '0' && fi.fname[1] <= '9' &&
-        fi.fname[2] >= '0' && fi.fname[2] <= '9' &&
-        fi.fname[3] >= '0' && fi.fname[3] <= '9')
-    {
-      uint16_t n = (uint16_t)((fi.fname[1] - '0') * 100 + (fi.fname[2] - '0') * 10 + (fi.fname[3] - '0'));
-      if (n > maxN) maxN = n;
-    }
-  }
-  f_closedir(&dir);
-  sdRunNumber = maxN;
-}
-
-static uint8_t sd_mount(void)
-{
-  FRESULT fr;
-
-  sdCardPresent = sd_card_detect();
-#if SD_CD_REQUIRED
-  if (!sdCardPresent)
-  {
-    sdState = SD_OFF;
-    return 0;
-  }
-#endif
-
-  f_mount(NULL, USERPath, 0);
-  USER_Driver.disk_initialize(0);          /* (re)start the card itself: FatFs only does this once per boot */
-  fr = f_mount(&USERFatFS, USERPath, 1);
-  if (fr != FR_OK)
-  {
-    sdLastFres = (int)fr;
-    sdState = SD_FAILED;
-    return 0;
-  }
-
-  sd_scan_run_number();
-  sdState = SD_READY;
-  dbg_printf("SD: card mounted, next file is run %03u\r\n", (unsigned)(sdRunNumber + 1));
-  return 1;
-}
-
-static uint8_t sd_append(const char *s, uint32_t n)
-{
-  if (sdState != SD_LOGGING) return 0;
-  if (n > (LOG_SD_BUFFER_SIZE - sdUsed))
-  {
-    sdDropRows++;                          /* card fell behind; keep the loop on time instead of waiting */
-    return 0;
-  }
-  uint32_t first = LOG_SD_BUFFER_SIZE - sdHead;
-  if (first > n) first = n;
-  memcpy(&sdBuf[sdHead], s, first);
-  memcpy(&sdBuf[0], s + first, n - first);
-  sdHead = (sdHead + n) % LOG_SD_BUFFER_SIZE;
-  sdUsed += n;
-  return 1;
-}
-
-/* Writes n bytes starting at the tail; n must not run past the end of the buffer */
-static uint8_t sd_write_bytes(uint32_t n)
-{
-  UINT bw = 0;
-  FRESULT fr = f_write(&sdFile, &sdBuf[sdTail], n, &bw);
-  if (fr != FR_OK || bw != n)
-  {
-    sd_fail("write", (fr != FR_OK) ? fr : FR_DISK_ERR);   /* bw < n means the card is full */
-    return 0;
-  }
-  sdTail = (sdTail + n) % LOG_SD_BUFFER_SIZE;
-  sdUsed -= n;
-  return 1;
-}
-
-static uint8_t sd_open_new(uint8_t armed, uint8_t corr)
-{
-  FRESULT fr = FR_EXIST;
-  for (uint8_t tries = 0; tries < 20 && fr == FR_EXIST; tries++)
-  {
-    if (++sdRunNumber > 999) sdRunNumber = 1;
-    /* 8.3 name: R + run + A(rmed)/G(round) + _ON/OFF, e.g. R007A_ON.CSV */
-    snprintf(sdFileName, sizeof(sdFileName), "R%03u%c%s.CSV", (unsigned)(sdRunNumber % 1000u), armed ? 'A' : 'G', corr ? "_ON" : "OFF");
-    fr = f_open(&sdFile, sdFileName, FA_WRITE | FA_CREATE_NEW);
-  }
-  if (fr != FR_OK)
-  {
-    sd_fail("open", fr);
-    return 0;
-  }
-
-  sdState = SD_LOGGING;
-  sdFileArmed = armed;
-  sdFileCorr = corr;
-  sdRowCount = 0;
-  sdHead = sdTail = sdUsed = 0;
-  sdLastSyncTick = HAL_GetTick();
-  sd_append(LOG_HEADER "\r\n", sizeof(LOG_HEADER "\r\n") - 1);
-  dbg_printf("SD: logging to %s\r\n", sdFileName);
-  return 1;
-}
-
-static void sd_close(void)
-{
-  if (sdState != SD_LOGGING) return;
-
-  /* write out everything still buffered, including the last part-sector */
-  while (sdUsed > 0)
-  {
-    uint32_t n = LOG_SD_BUFFER_SIZE - sdTail;
-    if (n > sdUsed) n = sdUsed;
-    if (!sd_write_bytes(n)) return;
-  }
-  FRESULT fr = f_close(&sdFile);
-  if (fr != FR_OK)
-  {
-    sd_fail("close", fr);
-    return;
-  }
-  dbg_printf("SD: closed %s (%lu rows)\r\n", sdFileName, (unsigned long)sdRowCount);
-  sdHead = sdTail = sdUsed = 0;
-  sdState = SD_READY;
-  strcpy(sdFileName, "-");
-}
-
-/* Called before each row is added: opens, closes or splits the file so every row lands in the right one.
- * wantFile = the baseline is locked (rows only exist then). */
-static void sd_update_file(uint8_t wantFile, uint8_t armed, uint8_t corr)
-{
-  if (sdState == SD_LOGGING)
-  {
-    uint8_t split = (!wantFile) || logNewFile;
-#if LOG_SD_NEW_FILE_ON_ARM
-    if (armed != sdFileArmed) split = 1;
-#endif
-#if LOG_SD_NEW_FILE_ON_CORR
-    if (corr != sdFileCorr) split = 1;
-#endif
-    if (split) sd_close();
-  }
-  logNewFile = 0;
-
-  if (sdState == SD_READY && wantFile) sd_open_new(armed, corr);
-}
-
-/* Called once per loop, after the FC has been sent its RC frame: writes buffered sectors, commits the file
- * periodically, and retries a failed card while disarmed. */
-static void sd_service(uint8_t armed)
-{
-  uint32_t t0 = HAL_GetTick();
-
-  if ((sdState == SD_FAILED || sdState == SD_OFF) && !armed && (t0 - sdLastRetryTick) >= LOG_SD_RETRY_MS)
-  {
-    sdLastRetryTick = t0;
-    sd_mount();
-  }
-
-  if (sdState == SD_LOGGING)
-  {
-    for (uint8_t k = 0; k < LOG_SD_MAX_SECTORS_PER_LOOP && sdUsed >= 512; k++)
-    {
-      if (!sd_write_bytes(512)) break;     /* tail stays 512-aligned, so a sector never wraps the buffer */
-    }
-  }
-
-  if (sdState == SD_LOGGING && (HAL_GetTick() - sdLastSyncTick) >= LOG_SD_SYNC_MS)
-  {
-    sdLastSyncTick = HAL_GetTick();
-    FRESULT fr = f_sync(&sdFile);
-    if (fr != FR_OK) sd_fail("sync", fr);
-  }
-
-  uint16_t ms = (uint16_t)(HAL_GetTick() - t0);
-  if (ms > sdServiceMsMax) sdServiceMsMax = ms;
-}
-
-static void sd_init(void)
-{
-  GPIO_InitTypeDef g = {0};
-  __HAL_RCC_GPIOB_CLK_ENABLE();
-  g.Pin = SD_CD_PIN;
-  g.Mode = GPIO_MODE_INPUT;
-  g.Pull = GPIO_PULLUP;
-  HAL_GPIO_Init(SD_CD_PORT, &g);
-  HAL_Delay(2);
-
-  if (!sd_mount())
-  {
-    dbg_printf("SD: no card mounted (card-detect=%u, FatFs error %d). Logging to serial only; retrying every %u s while disarmed\r\n",
-               (unsigned)sdCardPresent, sdLastFres, (unsigned)(LOG_SD_RETRY_MS / 1000));
-    if (sdState == SD_OFF) sdState = SD_FAILED;   /* so it keeps retrying */
-    sdLastRetryTick = HAL_GetTick();
-  }
-}
-#endif /* LOG_SD_ENABLE */
 
 /* USER CODE END 0 */
 
@@ -1726,10 +1449,6 @@ int main(void)
 
   dbg_printf("\r\n--- Companion board boot, starting MSP handshake ---\r\n");
 
-#if LOG_SD_ENABLE
-  sd_init();
-#endif
-
 #if INPUT_SOURCE == INPUT_LORA
   if (lora_init() == HAL_OK)
   {
@@ -1739,6 +1458,11 @@ int main(void)
   {
     dbg_printf("LoRa radio FAILED - check SPI1 wiring (PA4/5/6/7, PB0 reset) and the RFM95W 3.3 V supply\r\n");
   }
+#endif
+
+#if SD_LOG_ENABLE
+  sdLogStatus = Logger_Init();
+  dbg_printf("SD log: status=%d file=%s\r\n", (int)sdLogStatus, Logger_FileName());
 #endif
 
   /* Give the FC time to boot, then check the MSP link */
@@ -1812,16 +1536,6 @@ int main(void)
   int16_t rollMin = 0, rollMax = 0, pitchMin = 0, pitchMax = 0;
   uint32_t debugLoopCounter = 0;
   uint32_t lastStatsPrint = HAL_GetTick();
-  uint32_t prevLoopStart = 0;
-  uint32_t lastHeaderPrint = 0;
-  uint8_t  headerPrinted = 0;
-  (void)lastHeaderPrint;
-  (void)headerPrinted;
-
-#if DEBUG_UART_ENABLE
-  dbg_printf("Type ? in this terminal for logging keys (needs the adapter's TX on J7 pin 2)\r\n");
-  dbgBlocking = 0;                         /* from here on, serial output is sent in the gaps between loop work */
-#endif
 
   /* USER CODE END 2 */
 
@@ -1832,28 +1546,6 @@ int main(void)
     uint32_t loopStart = HAL_GetTick();
     debugLoopCounter++;
     loopCount++;
-    dbg_pump();
-
-    /* full loop period (work + SD writes + wait); only counted once the baseline is locked */
-    if (baselineCaptured && prevLoopStart != 0)
-    {
-      uint16_t period = (uint16_t)(loopStart - prevLoopStart);
-      if (period > loopPeriodMsMax) loopPeriodMsMax = period;
-    }
-    prevLoopStart = loopStart;
-
-    if (logMarker)
-    {
-      logMarker = 0;
-      markerCount++;
-      dbg_printf("MARK %lu at t=%lu ms\r\n", (unsigned long)markerCount, (unsigned long)loopStart);
-    }
-    if (dbgRezeroRequest)
-    {
-      dbgRezeroRequest = 0;
-      if (txArmDbg < 1500) rezeroBaseline = 1;
-      else dbg_printf("Re-zero refused: disarm first\r\n");
-    }
 
     if (rezeroBaseline)
     {
@@ -1891,15 +1583,6 @@ int main(void)
     }
 
     pilotLinkAlive = (pilotSeen && (HAL_GetTick() - lastPilotTick) <= PILOT_FAILSAFE_TIMEOUT_MS);
-    if (pilotSeen)
-    {
-      uint32_t age = HAL_GetTick() - lastPilotTick;
-      pilotPktAgeMs = (uint16_t)((age > 65534) ? 65534 : age);
-    }
-    else
-    {
-      pilotPktAgeMs = 0xFFFF;
-    }
     if (pilotLinkAlive) LED_ON(LED_LINK_PORT, LED_LINK_PIN); else LED_OFF(LED_LINK_PORT, LED_LINK_PIN);
 
 #ifdef FLIGHT_TEST_ENABLE
@@ -2009,8 +1692,7 @@ int main(void)
 #endif /* FLIGHT_TEST_ENABLE */
 
     /* ---- 3. Failsafe: once a pilot link has been seen, losing it cuts throttle and disarms ---- */
-    failsafeActive = (pilotSeen && !pilotLinkAlive);
-    if (failsafeActive)
+    if (pilotSeen && !pilotLinkAlive)
     {
       rcChannels[2] = 1000;
       rcChannels[4] = 1000;
@@ -2018,8 +1700,6 @@ int main(void)
 
     /* Pilot input is passed through untouched unless the correction adds a bias below */
     memcpy(txChannels, rcChannels, sizeof(txChannels));
-    pilotRollDbg  = rcChannels[0];   /* logged as pilotRoll/pilotPitch: the stick before any bias */
-    pilotPitchDbg = rcChannels[1];
 
     /* ---- 4. Read gyro and attitude from the FC ----------------------------- */
     int16_t roll, pitch, yaw;
@@ -2127,14 +1807,6 @@ int main(void)
 #if STATS_ENABLE
         stats_add(correctionActive ? &statsOn : &statsOff, deltaRoll, deltaPitch);
 #endif
-
-        /* Disturbance flag for the log: 1 while either axis is past the threshold, and count each onset */
-        {
-          uint8_t d = (deltaRoll  > ATTITUDE_DISTURBANCE_THRESHOLD_DECIDEG || deltaRoll  < -ATTITUDE_DISTURBANCE_THRESHOLD_DECIDEG ||
-                       deltaPitch > ATTITUDE_DISTURBANCE_THRESHOLD_DECIDEG || deltaPitch < -ATTITUDE_DISTURBANCE_THRESHOLD_DECIDEG);
-          if (d && !distActive) distEventCount++;
-          distActive = d;
-        }
       }
     }
     else
@@ -2161,48 +1833,119 @@ int main(void)
       }
     }
 
+    /* ---- 5b. Extra FC readings: its armed state, the channels it received, and the battery ---- */
+#if FC_EXTRA_POLL_ENABLE
+    if ((debugLoopCounter % FC_EXTRA_POLL_EVERY_N_LOOPS) == 0)
+    {
+      switch ((debugLoopCounter / FC_EXTRA_POLL_EVERY_N_LOOPS) % 3)
+      {
+        case 0:   /* MSP_STATUS */
+        {
+          uint16_t cyc = 0, sens = 0;
+          uint32_t flags = 0;
+          if (msp_get_status(&huart1, &cyc, &sens, &flags) == HAL_OK)
+          {
+            fcCycleTimeUs = cyc;
+            fcSensors     = sens;
+            fcModeFlags   = flags;
+            fcArmed       = (uint8_t)(flags & 1u);
+            fcStatusOkCount++;
+          }
+          else
+          {
+            fcStatusFailCount++;
+          }
+          break;
+        }
+        case 1:   /* MSP_RC: compare the FC's echo with what we sent last loop */
+        {
+          uint16_t rc[RC_CHANNEL_COUNT];
+          if (msp_get_rc(&huart1, rc) == HAL_OK)
+          {
+            uint8_t mismatch = 0;
+            for (uint8_t i = 0; i < RC_CHANNEL_COUNT; i++)
+            {
+              fcRc[i] = rc[i];
+              if (lastSentRcValid)
+              {
+                int32_t d = (int32_t)rc[i] - (int32_t)lastSentRc[i];
+                if (d < 0) d = -d;
+                if (d > FC_RC_ECHO_TOLERANCE_US) mismatch = 1;
+              }
+            }
+            if (mismatch) fcRcMismatchCount++;
+            fcRcOkCount++;
+          }
+          else
+          {
+            fcRcFailCount++;
+          }
+          break;
+        }
+        default:  /* MSP_ANALOG, and the optional low-battery cutoff */
+        {
+          static uint8_t battLowCount = 0;
+          uint16_t vb = 0, mah = 0;
+          int16_t amps = 0;
+          if (msp_get_analog(&huart1, &vb, &mah, &amps) == HAL_OK)
+          {
+            fcVbatDeci  = vb;
+            fcMahDrawn  = mah;
+            fcAmpsCenti = amps;
+            fcAnalogOkCount++;
+#if BATT_CUTOFF_ENABLE
+            if (BATT_CUTOFF_DECIV > 0 && vb > 0 && vb < BATT_CUTOFF_DECIV)
+            {
+              if (battLowCount < 255) battLowCount++;
+              if (battLowCount >= BATT_CUTOFF_READS) battLowLatched = 1;
+            }
+            else
+            {
+              battLowCount = 0;
+            }
+#else
+            (void)battLowCount;
+#endif
+          }
+          else
+          {
+            fcAnalogFailCount++;
+          }
+          break;
+        }
+      }
+    }
+#endif
+
+#if BATT_CUTOFF_ENABLE
+    if (battLowLatched)
+    {
+      txChannels[2] = 1000;   /* minimum throttle */
+      txChannels[4] = 1000;   /* disarm */
+    }
+#endif
+
     /* ---- 6. Send to the FC: pilot input + correction bias ------------------- */
     txRollDbg     = txChannels[0];
     txPitchDbg    = txChannels[1];
     txThrottleDbg = txChannels[2];
     txArmDbg      = txChannels[4];
     msp_set_raw_rc(&huart1, txChannels, RC_CHANNEL_COUNT);
+    for (uint8_t i = 0; i < RC_CHANNEL_COUNT; i++) lastSentRc[i] = txChannels[i];
+    lastSentRcValid = 1;
 
     /* ---- 7. Logging --------------------------------------------------------- */
-    {
-      /* One row, built once. row = "CSV," + the CSV line; the SD card gets the line without the prefix. */
-      char row[4 + 320];
-      int  rowLen = 0;
-      uint8_t armedNow = (txChannels[4] >= 1500);
-      (void)armedNow;
-
-      if (baselineCaptured)
-      {
-        memcpy(row, "CSV,", 4);
-        rowLen = log_format_row(&row[4], sizeof(row) - 4);
-      }
-
-#if LOG_SD_ENABLE
-      sd_update_file(baselineCaptured, armedNow, correctionActive);
-      if (rowLen > 0 && (debugLoopCounter % LOG_SD_EVERY_N_LOOPS) == 0 && sdState == SD_LOGGING)
-      {
-        if (sd_append(&row[4], (uint32_t)rowLen)) sdRowCount++;
-      }
-#endif
-
 #if LOG_CSV_ENABLE
-      if (baselineCaptured && (!headerPrinted || (HAL_GetTick() - lastHeaderPrint) >= LOG_HEADER_EVERY_MS))
-      {
-        log_print_header_serial();
-        headerPrinted = 1;
-        lastHeaderPrint = HAL_GetTick();
-      }
-      if (rowLen > 0 && (debugLoopCounter % LOG_CSV_EVERY_N_LOOPS) == 0)
-      {
-        dbg_write(row, (uint16_t)(rowLen + 4));
-      }
-#endif
+    if (baselineCaptured && (debugLoopCounter % LOG_CSV_EVERY_N_LOOPS) == 0)
+    {
+      /* CSV,ms,attRoll,attPitch,deltaRoll,deltaPitch,gyroRoll,gyroPitch,biasRoll,biasPitch,corr,thr,arm,m1,m2,m3,m4 */
+      dbg_printf("CSV,%lu,%d,%d,%d,%d,%d,%d,%d,%d,%u,%u,%u,%u,%u,%u,%u\r\n",
+                 (unsigned long)HAL_GetTick(), attRoll, attPitch, deltaRoll, deltaPitch,
+                 gyroRoll, gyroPitch, biasRoll, biasPitch, (unsigned)correctionActive,
+                 (unsigned)txThrottleDbg, (unsigned)txArmDbg,
+                 (unsigned)motorOut[0], (unsigned)motorOut[1], (unsigned)motorOut[2], (unsigned)motorOut[3]);
     }
+#endif
 
     if ((debugLoopCounter % STATUS_PRINT_EVERY_N_LOOPS) == 0 && baselineCaptured)
     {
@@ -2212,28 +1955,28 @@ int main(void)
                  (unsigned)txThrottleDbg, (unsigned)txArmDbg,
                  (unsigned)motorOut[0], (unsigned)motorOut[1], (unsigned)motorOut[2], (unsigned)motorOut[3],
                  (unsigned long)attitudeFailCount, (unsigned long)gyroFailCount, (unsigned long)motorFailCount,
-                 distActive ? " DISTURBANCE" : "");
+                 ((deltaRoll > ATTITUDE_DISTURBANCE_THRESHOLD_DECIDEG || deltaRoll < -ATTITUDE_DISTURBANCE_THRESHOLD_DECIDEG ||
+                   deltaPitch > ATTITUDE_DISTURBANCE_THRESHOLD_DECIDEG || deltaPitch < -ATTITUDE_DISTURBANCE_THRESHOLD_DECIDEG) ? " DISTURBANCE" : ""));
     }
 
+#if FC_EXTRA_POLL_ENABLE
     if ((debugLoopCounter % STATUS_PRINT_EVERY_N_LOOPS) == 0)
     {
-      dbg_printf("HEALTH: msp ok=%lu | loop avg=%lu max=%u period max=%u ms overruns=%lu | serial drops=%lu | SD %s %s rows=%lu drops=%lu err=%lu (last %d) write max=%u ms | marks=%lu dist=%lu\r\n",
-                 (unsigned long)mspReplyOkCount,
-                 (unsigned long)(loopWorkN ? (loopWorkSumMs / loopWorkN) : 0), (unsigned)loopWorkMsMax,
-                 (unsigned)loopPeriodMsMax, (unsigned long)loopOverrunCount,
-                 (unsigned long)dbgDropCount,
-                 sd_state_name(), sdFileName, (unsigned long)sdRowCount, (unsigned long)sdDropRows,
-                 (unsigned long)sdErrCount, sdLastFres, (unsigned)sdServiceMsMax,
-                 (unsigned long)markerCount, (unsigned long)distEventCount);
+      dbg_printf("FC: armed=%u cycle=%uus vbat=%u.%uV amps(0.01A)=%d used=%umAh rcMismatch=%lu fails st=%lu rc=%lu an=%lu%s\r\n",
+                 (unsigned)fcArmed, (unsigned)fcCycleTimeUs,
+                 (unsigned)(fcVbatDeci / 10), (unsigned)(fcVbatDeci % 10), (int)fcAmpsCenti, (unsigned)fcMahDrawn,
+                 (unsigned long)fcRcMismatchCount,
+                 (unsigned long)fcStatusFailCount, (unsigned long)fcRcFailCount, (unsigned long)fcAnalogFailCount,
+                 battLowLatched ? " BATTERY CUTOFF" : "");
     }
+#endif
 
 #if INPUT_SOURCE == INPUT_LORA
     if ((debugLoopCounter % STATUS_PRINT_EVERY_N_LOOPS) == 0)
     {
-      dbg_printf("LORA: ready=%u pkts=%lu bad=%lu lost=%lu seq=%u age=%u ms rssi=%d dBm failsafe=%u\r\n",
+      dbg_printf("LORA: ready=%u pkts=%lu bad=%lu lost=%lu rssi=%d dBm\r\n",
                  (unsigned)loraReady, (unsigned long)loraPktCount, (unsigned long)loraCrcErrCount,
-                 (unsigned long)loraLostCount, (unsigned)loraLastSeq, (unsigned)pilotPktAgeMs,
-                 (int)loraRssiDbm, (unsigned)failsafeActive);
+                 (unsigned long)loraLostCount, (int)loraRssiDbm);
     }
 #endif
 
@@ -2243,6 +1986,19 @@ int main(void)
       lastStatsPrint = HAL_GetTick();
       if (baselineCaptured) stats_print();
     }
+#endif
+
+#if SD_LOG_ENABLE
+    if ((debugLoopCounter % SD_LOG_EVERY_N_LOOPS) == 0)
+    {
+      g_log.t_ms     = HAL_GetTick();
+      g_log.thr_tx   = txThrottleDbg;
+      g_log.arm_tx   = (txArmDbg > 1500);
+      g_log.fc_armed = fcArmed;
+      g_log.link_ok  = pilotLinkAlive;
+      Logger_Push(&g_log);
+    }
+    Logger_Service();
 #endif
 
     /* loop timing instrumentation: counts only once the baseline is locked */
@@ -2255,13 +2011,10 @@ int main(void)
       loopWorkN++;
     }
 
-    /* ---- 8. SD writes, then pace the loop so timing is steady ----------------- */
-#if LOG_SD_ENABLE
-    sd_service(txChannels[4] >= 1500);
-#endif
+    /* ---- 8. Pace the loop so timing is steady --------------------------------- */
     while ((HAL_GetTick() - loopStart) < LOOP_PERIOD_MS)
     {
-      dbg_pump();   /* send queued serial output while we wait */
+      /* In CRSF mode the pilot poll blocks briefly; otherwise just wait out the remainder of the period */
     }
 
     /* USER CODE END WHILE */
@@ -2293,8 +2046,8 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = 16;
-  RCC_OscInitStruct.PLL.PLLN = 200;
+  RCC_OscInitStruct.PLL.PLLM = 8;
+  RCC_OscInitStruct.PLL.PLLN = 96;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = 4;
   if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
@@ -2340,7 +2093,7 @@ static void MX_SPI2_Init(void)
   hspi2.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi2.Init.CLKPhase = SPI_PHASE_1EDGE;
   hspi2.Init.NSS = SPI_NSS_SOFT;
-  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_2;
+  hspi2.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_128;
   hspi2.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi2.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi2.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
@@ -2350,28 +2103,6 @@ static void MX_SPI2_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN SPI2_Init 2 */
-
-  /* SD card: pull MISO up so an empty slot reads 0xFF (no card = fast "not ready", not a long timeout) */
-  {
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-    GPIO_InitStruct.Pin = GPIO_PIN_14;
-    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-    GPIO_InitStruct.Alternate = GPIO_AF5_SPI2;
-    HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
-  }
-  /* SD card chip select (PA8): idle high so the card ignores the bus until FatFs talks to it */
-  {
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-    __HAL_RCC_GPIOA_CLK_ENABLE();
-    HAL_GPIO_WritePin(GPIOA, GPIO_PIN_8, GPIO_PIN_SET);
-    GPIO_InitStruct.Pin = GPIO_PIN_8;
-    GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-    GPIO_InitStruct.Pull = GPIO_NOPULL;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-  }
 
   /* USER CODE END SPI2_Init 2 */
 
@@ -2470,17 +2201,6 @@ static void MX_USART6_UART_Init(void)
     }
   #endif
 
-  /* Pull the RX pin (PA12, J7 pin 2) up so an unconnected pin idles high instead of "receiving" noise as key presses */
-  {
-    GPIO_InitTypeDef GPIO_InitStruct = {0};
-    GPIO_InitStruct.Pin = GPIO_PIN_11 | GPIO_PIN_12;
-    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
-    GPIO_InitStruct.Pull = GPIO_PULLUP;
-    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-    GPIO_InitStruct.Alternate = GPIO_AF8_USART6;
-    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
-  }
-
   /* USER CODE END USART6_Init 2 */
 
 }
@@ -2502,7 +2222,23 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOA_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(SD_CS_GPIO_Port, SD_CS_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, GPIO_PIN_5|GPIO_PIN_6, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin : SD_CD_Pin */
+  GPIO_InitStruct.Pin = SD_CD_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(SD_CD_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : SD_CS_Pin */
+  GPIO_InitStruct.Pin = SD_CS_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(SD_CS_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PB5 PB6 */
   GPIO_InitStruct.Pin = GPIO_PIN_5|GPIO_PIN_6;
