@@ -27,7 +27,9 @@
 #define SD_CARD_PRESENT() (HAL_GPIO_ReadPin(GPIOB, GPIO_PIN_10) == GPIO_PIN_RESET)
 #endif
 
-#define LOG_HEADER "t_ms,thr_tx,arm_tx,fc_armed,link_ok\n"
+#define LOG_HEADER "t_ms,thr_tx,arm_tx,fc_armed,link_ok," \
+                   "vbat_deci,amps_centi,mah_drawn," \
+                   "cmd_roll,cmd_pitch,cmd_yaw,tx_roll,tx_pitch,tx_yaw,att_roll,att_pitch,att_yaw\n"
 
 /* ---- State ------------------------------------------------------------ */
 volatile logger_stats_t logger_stats;
@@ -137,8 +139,12 @@ void Logger_Push(const log_record_t *r)
 
     c0 = DWT->CYCCNT;
 
-    len = snprintf(line, sizeof(line), "%lu,%u,%u,%u,%u\n",
-        (unsigned long)r->t_ms, r->thr_tx, r->arm_tx, r->fc_armed, r->link_ok);
+    len = snprintf(line, sizeof(line), "%lu,%u,%u,%u,%u,%u,%d,%u,%d,%d,%d,%u,%u,%u,%d,%d,%d\n",
+        (unsigned long)r->t_ms, r->thr_tx, r->arm_tx, r->fc_armed, r->link_ok,
+        r->vbat_deci, r->amps_centi, r->mah_drawn,
+        r->cmd_roll, r->cmd_pitch, r->cmd_yaw,
+        r->tx_roll, r->tx_pitch, r->tx_yaw,
+        r->att_roll, r->att_pitch, r->att_yaw);
 
     if (len <= 0 || len >= (int)sizeof(line)) { logger_stats.records_dropped++; return; }
 
