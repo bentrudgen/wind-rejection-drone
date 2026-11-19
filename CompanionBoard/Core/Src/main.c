@@ -122,7 +122,7 @@
 #endif
 
 #define SD_LOG_ENABLE             1   /* 1 = log to the SD card */
-#define SD_LOG_EVERY_N_LOOPS      1   /* 1 = a row every loop (50 Hz)
+#define SD_LOG_EVERY_N_LOOPS      1   /* 1 = a row every loop (50 Hz) */
 
 
 /* >>>>>> 1B. RECEIVER SETTINGS: radio, packet layout, sticks and buttons  <<<<<< */
@@ -174,6 +174,36 @@
 #define AXIS_RY_INVERT            0
 #define STICK_DEADBAND_US         25           /* ignore tiny stick offsets (stick drift) */
 
+/* Stick scaling: how much of the full +/-500 us range a full stick deflection sends to the FC.
+ * 100 = full range. 30 = full stick sends +/-150 us (1350..1650), for small, controlled movements.
+ * Applies to every pilot input source (LoRa or CRSF). Throttle is not scaled (it has THROTTLE_MAX_US).
+ * The correction still decides "is the pilot using this axis?" from the stick BEFORE scaling,
+ * so CORRECTION_STICK_DEADBAND_US keeps meaning the same physical stick movement at any scale. */
+#define STICK_SCALE_ROLL_PCT      20
+#define STICK_SCALE_PITCH_PCT     20
+#define STICK_SCALE_YAW_PCT       20
+/* Stick hold: when 1, letting a stick spring back to centre keeps the last push instead of returning to 0.
+ *   - Each push sets that axis to the FURTHEST point reached during the push (so the spring-back on release
+ *     doesn't change it). Pushing harder raises it; a new push in the same direction replaces it.
+ *   - A push in the OPPOSITE direction clears the axis back to centre (0). Push again to set a new value.
+ *   - Pushes smaller than STICK_HOLD_MIN_PUSH_US are ignored, so stick jitter and the overshoot when the stick
+ *     snaps back can't set or clear anything.
+ *   - Holds only apply while armed, and are cleared on disarm and on link loss. While disarmed the sticks
+ *     pass through live (so the Betaflight Receiver tab still shows them).
+ *   - An axis with a held value counts as "pilot is using this axis", so the correction leaves it alone.
+ *   - LoRa controller only (a CRSF radio has its own sticks/trims).
+ * Careful: a held roll/pitch in ANGLE mode is a held tilt, so the drone keeps drifting that way.
+ * A held yaw is a constant spin rate in every flight mode. */
+#define STICK_HOLD_ENABLE         1            /* 1 = hold mode on, 0 = sticks return to centre (normal) */
+#define STICK_HOLD_ROLL           1            /* per-axis: which axes hold when STICK_HOLD_ENABLE is 1 */
+#define STICK_HOLD_PITCH          1
+#define STICK_HOLD_YAW            1
+#define STICK_HOLD_MIN_PUSH_US    100          /* a push must reach this far (us, before scaling; 500 = full stick) to count */
+
+#if STICK_SCALE_ROLL_PCT < 0 || STICK_SCALE_ROLL_PCT > 100 || STICK_SCALE_PITCH_PCT < 0 || STICK_SCALE_PITCH_PCT > 100 || STICK_SCALE_YAW_PCT < 0 || STICK_SCALE_YAW_PCT > 100
+#error STICK_SCALE_*_PCT must be 0..100
+#endif
+
 /* Buttons (called L3 / R3 in this file). Button 1 = L3, button 2 = R3. */
 #define BTN_BYTE_OFF              7            /* byte holding the button bits */
 #define BTN_L3_MASK               0x01         /* button 1 */
@@ -194,6 +224,13 @@ enum { AX_LX = 0, AX_LY = 1, AX_RX = 2, AX_RY = 3 };
 #define THROTTLE_INTEGRATE        1
 #define THROTTLE_RATE_US_PER_SEC  75          /* full stick deflection changes throttle by this many us per second */
 #define THROTTLE_MAX_US           1500         /* hard cap on throttle from the controller. Raise slowly during testing */
+#define THROTTLE_ARMED_START_US   1200         /* after arming, throttle jumps here so the stick works in the useful range.
+                                                * Keep it below hover so the drone stays on the ground. 1000 = start from idle */
+#define THROTTLE_ARM_HOLD_MS      500          /* throttle is held at 1000 this long after the ARM press, because Betaflight
+                                                * refuses to arm while throttle is above min_check (default 1050) */
+#if THROTTLE_ARMED_START_US >= THROTTLE_MAX_US || THROTTLE_MAX_US > 2000 || THROTTLE_ARMED_START_US < 1000
+#error check THROTTLE_ARMED_START_US / THROTTLE_MAX_US (need 1000 <= start < max <= 2000)
+#endif
 
 
 /* >>>>>> 1C. FC LINK AND SAFETY: MSP constants, loop timing, failsafe <<<<<< */
@@ -244,7 +281,7 @@ enum { AX_LX = 0, AX_LY = 1, AX_RX = 2, AX_RY = 3 };
 #define CORRECTION_RATE_DEADBAND_DPS    15   /* ignore body rate under 15 deg/s */
 #define GYRO_FILTER_PCT                 30   /* gyro low-pass (lower = smoother) */
 #define CORRECTION_MAX_US             100    /* correction can move a stick at most +/-100 us */
-#define CORRECTION_STICK_DEADBAND_US  40     /* pilot stick beyond +/-40 us of centre = pilot owns that axis */
+#define CORRECTION_STICK_DEADBAND_US  40     /* pilot stick beyond +/-40 us of centre = pilot owns that axis (measured before STICK_SCALE) */
 /* Sign conventions verified on the bench: tilt right -> roll bias negative, nose up -> pitch bias positive */
 #define CORRECTION_ROLL_SIGN          (-1)
 #define CORRECTION_PITCH_SIGN         (-1)
@@ -307,11 +344,16 @@ volatile int16_t  biasRoll = 0, biasPitch = 0;
 volatile int16_t  deltaRoll = 0, deltaPitch = 0;
 volatile int16_t  gyroRoll = 0, gyroPitch = 0;
 volatile int16_t  attRoll = 0, attPitch = 0;          /* live attitude, decidegrees */
+volatile int16_t  attYaw = 0;                         /* live heading from the FC, whole degrees (0..359) */
 volatile int16_t  baseRollDbg = 0, basePitchDbg = 0;  /* locked baseline, decidegrees */
+/* The roll / pitch / yaw command currently in effect, BEFORE stick scaling, -500..+500 us from centre.
+ * With STICK_HOLD on this is the held value (or the live stick while disarmed); with it off, the live stick. */
+volatile int16_t  stickRawRollUs = 0, stickRawPitchUs = 0, stickRawYawUs = 0;
 volatile uint8_t  rezeroBaseline = 0;                 /* set to 1 to re-capture the level baseline (hold flat and still) */
 volatile uint8_t  statsReset = 0;                     /* set to 1 to clear the OFF/ON attitude statistics */
 volatile uint16_t motorOut[4] = {0, 0, 0, 0};         /* motor outputs the FC is commanding, 1000-2000 */
 volatile uint16_t txRollDbg = 1500, txPitchDbg = 1500, txThrottleDbg = 1000, txArmDbg = 1000; /* RC we send to the FC */
+volatile uint16_t txYawDbg = 1500;                    /* yaw we send to the FC (after scaling) */
 volatile uint32_t loopCount = 0;
 volatile uint32_t attitudeFailCount = 0;
 volatile uint32_t gyroFailCount = 0;
@@ -808,7 +850,56 @@ static HAL_StatusTypeDef lora_init(void)
 
 volatile uint8_t  armLatched = 0;         /* ARM state toggled by the controller button */
 volatile uint8_t  corrLatched = 0;        /* correction state toggled by the controller button */
-volatile int16_t  stickUs[4] = {0, 0, 0, 0};   /* decoded stick offsets, -500..+500: LX, LY, RX, RY */
+volatile int16_t  stickUs[4] = {0, 0, 0, 0};   /* decoded stick offsets, -500..+500: LX, LY, RX, RY (live, before any hold) */
+volatile int16_t  stickHeldUs[4] = {0, 0, 0, 0}; /* STICK_HOLD: value each axis is holding, -500..+500 (0 = centred) */
+
+#if STICK_HOLD_ENABLE
+/* One axis of stick hold. live = this packet's stick (-500..+500), returns the value to send. */
+static int16_t stick_hold_axis(uint8_t axis, int16_t live)
+{
+  static uint8_t pushActive[4] = {0, 0, 0, 0};
+  static int8_t  pushDir[4]    = {0, 0, 0, 0};   /* +1 / -1 = setting a value, 0 = this push is a "clear" push */
+  int16_t held = stickHeldUs[axis];
+  int16_t mag  = (int16_t)(live < 0 ? -live : live);
+
+  if (mag < STICK_HOLD_MIN_PUSH_US)
+  {
+    pushActive[axis] = 0;                        /* stick (nearly) centred: keep whatever is held */
+    return held;
+  }
+
+  int8_t dir = (live > 0) ? 1 : -1;
+  if (!pushActive[axis])
+  {
+    /* A new push. Opposite to the held value = clear; otherwise it starts a new held value. */
+    pushActive[axis] = 1;
+    if (held != 0 && dir != ((held > 0) ? 1 : -1))
+    {
+      pushDir[axis] = 0;
+      held = 0;
+    }
+    else
+    {
+      pushDir[axis] = dir;
+      held = live;
+    }
+  }
+  else if (pushDir[axis] == dir)
+  {
+    /* Same push, same direction: keep the furthest point reached */
+    if (mag > (held < 0 ? -held : held)) held = live;
+  }
+  /* (a clear push, or a swing past centre without releasing, changes nothing more) */
+
+  stickHeldUs[axis] = held;
+  return held;
+}
+
+static void stick_hold_clear(void)
+{
+  for (uint8_t i = 0; i < 4; i++) stickHeldUs[i] = 0;
+}
+#endif
 
 static int32_t pkt_u(const uint8_t *buf, uint8_t off)
 {
@@ -843,6 +934,8 @@ static void lora_decode_packet(const uint8_t *buf, PilotFrame *frame)
   static uint8_t  haveBtn = 0, prevArmBtn = 0, prevCorrBtn = 0;
   static uint32_t lastPktTick = 0, lastThrTick = 0;
   static uint16_t thr = 1000;
+  static uint32_t armPressTick = 0;
+  static uint8_t  armStartDone = 0;     /* 1 once the throttle has jumped to THROTTLE_ARMED_START_US for this arming */
 
   uint32_t now = HAL_GetTick();
 
@@ -874,7 +967,12 @@ static void lora_decode_packet(const uint8_t *buf, PilotFrame *frame)
     prevCorrBtn = corrBtn;
     haveBtn = 1;
   }
-  if (armBtn && !prevArmBtn)   armLatched  = !armLatched;      /* a press while armed disarms (acts as a kill) */
+  if (armBtn && !prevArmBtn)
+  {
+    armLatched = !armLatched;      /* a press while armed disarms (acts as a kill) */
+    armPressTick = now;
+    armStartDone = 0;
+  }
   if (corrBtn && !prevCorrBtn) corrLatched = !corrLatched;
   prevArmBtn = armBtn;
   prevCorrBtn = corrBtn;
@@ -884,6 +982,16 @@ static void lora_decode_packet(const uint8_t *buf, PilotFrame *frame)
   if (!armLatched)
   {
     thr = 1000;
+    armStartDone = 0;
+  }
+  else if ((now - armPressTick) < THROTTLE_ARM_HOLD_MS)
+  {
+    thr = 1000;                    /* let Betaflight see ARM with throttle low, or it refuses to arm */
+  }
+  else if (!armStartDone)
+  {
+    thr = THROTTLE_ARMED_START_US; /* jump once to the start value; the stick takes it from here */
+    armStartDone = 1;
   }
   else
   {
@@ -897,10 +1005,32 @@ static void lora_decode_packet(const uint8_t *buf, PilotFrame *frame)
     thr = (uint16_t)t;
   }
 
-  frame->ch[0] = (uint16_t)(1500 + stickUs[MAP_ROLL_AXIS]);
-  frame->ch[1] = (uint16_t)(1500 + stickUs[MAP_PITCH_AXIS]);
+  int16_t rollUs  = stickUs[MAP_ROLL_AXIS];
+  int16_t pitchUs = stickUs[MAP_PITCH_AXIS];
+  int16_t yawUs   = stickUs[MAP_YAW_AXIS];
+#if STICK_HOLD_ENABLE
+  if (!armLatched)
+  {
+    stick_hold_clear();           /* disarmed (or link was lost): no holds, sticks pass through live */
+  }
+  else
+  {
+#if STICK_HOLD_ROLL
+    rollUs  = stick_hold_axis(MAP_ROLL_AXIS,  rollUs);
+#endif
+#if STICK_HOLD_PITCH
+    pitchUs = stick_hold_axis(MAP_PITCH_AXIS, pitchUs);
+#endif
+#if STICK_HOLD_YAW
+    yawUs   = stick_hold_axis(MAP_YAW_AXIS,   yawUs);
+#endif
+  }
+#endif
+
+  frame->ch[0] = (uint16_t)(1500 + rollUs);
+  frame->ch[1] = (uint16_t)(1500 + pitchUs);
   frame->ch[2] = thr;
-  frame->ch[3] = (uint16_t)(1500 + stickUs[MAP_YAW_AXIS]);
+  frame->ch[3] = (uint16_t)(1500 + yawUs);
   frame->ch[4] = armLatched  ? 2000 : 1000;    /* AUX1 = ARM */
   frame->ch[5] = corrLatched ? 2000 : 1000;    /* AUX2 = correction toggle */
   frame->ch[6] = 1000;                         /* AUX3 */
@@ -1070,6 +1200,12 @@ static uint16_t clamp_rc(int32_t value)
   if (value < 1000) return 1000;
   if (value > 2000) return 2000;
   return (uint16_t)value;
+}
+
+/* Shrinks a stick channel around centre: 1500 + (ch - 1500) * pct / 100 */
+static uint16_t scale_stick(uint16_t ch, int32_t pct)
+{
+  return clamp_rc(1500 + (((int32_t)ch - 1500) * pct) / 100);
 }
 
 /* Expected-vs-actual comparison -> correction bias in RC microseconds.
@@ -1439,6 +1575,13 @@ int main(void)
       {
         rcChannels[i] = pilot.ch[i];
       }
+      /* Remember the real stick position for the correction's "pilot owns this axis" test, then scale it down */
+      stickRawRollUs  = (int16_t)((int32_t)rcChannels[0] - 1500);
+      stickRawPitchUs = (int16_t)((int32_t)rcChannels[1] - 1500);
+      stickRawYawUs   = (int16_t)((int32_t)rcChannels[3] - 1500);
+      rcChannels[0] = scale_stick(rcChannels[0], STICK_SCALE_ROLL_PCT);
+      rcChannels[1] = scale_stick(rcChannels[1], STICK_SCALE_PITCH_PCT);
+      rcChannels[3] = scale_stick(rcChannels[3], STICK_SCALE_YAW_PCT);
       pilotAux1 = rcChannels[4];
       lastPilotTick = HAL_GetTick();
       pilotSeen = 1;
@@ -1585,6 +1728,7 @@ int main(void)
     {
       attRoll  = roll;
       attPitch = pitch;
+      attYaw   = yaw;
 
       if (!baselineCaptured)
       {
@@ -1646,9 +1790,10 @@ int main(void)
         biasPitch = 0;
         if (correctionActive)
         {
-          /* The pilot owns an axis whenever its stick is off-centre; correction only acts on a neutral stick */
-          int16_t rollStick  = (int16_t)(rcChannels[0] - 1500);
-          int16_t pitchStick = (int16_t)(rcChannels[1] - 1500);
+          /* The pilot owns an axis whenever its stick is off-centre; correction only acts on a neutral stick.
+           * Uses the stick position BEFORE scaling, so the threshold is the same physical movement at any STICK_SCALE. */
+          int16_t rollStick  = stickRawRollUs;
+          int16_t pitchStick = stickRawPitchUs;
 
           if (rollStick < CORRECTION_STICK_DEADBAND_US && rollStick > -CORRECTION_STICK_DEADBAND_US)
           {
@@ -1789,6 +1934,7 @@ int main(void)
     /* ---- 6. Send to the FC: pilot input + correction bias ------------------- */
     txRollDbg     = txChannels[0];
     txPitchDbg    = txChannels[1];
+    txYawDbg      = txChannels[3];
     txThrottleDbg = txChannels[2];
     txArmDbg      = txChannels[4];
     msp_set_raw_rc(&huart1, txChannels, RC_CHANNEL_COUNT);
@@ -1857,6 +2003,18 @@ int main(void)
       g_log.arm_tx   = (txArmDbg > 1500);
       g_log.fc_armed = fcArmed;
       g_log.link_ok  = pilotLinkAlive;
+      g_log.vbat_deci  = fcVbatDeci;
+      g_log.amps_centi = fcAmpsCenti;
+      g_log.mah_drawn  = fcMahDrawn;
+      g_log.cmd_roll   = stickRawRollUs;
+      g_log.cmd_pitch  = stickRawPitchUs;
+      g_log.cmd_yaw    = stickRawYawUs;
+      g_log.tx_roll    = txRollDbg;
+      g_log.tx_pitch   = txPitchDbg;
+      g_log.tx_yaw     = txYawDbg;
+      g_log.att_roll   = attRoll;
+      g_log.att_pitch  = attPitch;
+      g_log.att_yaw    = attYaw;
       Logger_Push(&g_log);
     }
     Logger_Service();
