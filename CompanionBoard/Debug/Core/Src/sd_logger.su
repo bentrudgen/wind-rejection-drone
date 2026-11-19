@@ -1,9 +1,0 @@
-../Core/Src/sd_logger.c:46:13:enable_cycle_counter	4	static
-../Core/Src/sd_logger.c:53:13:fail	16	static
-../Core/Src/sd_logger.c:61:13:write_chunk	40	static
-../Core/Src/sd_logger.c:90:17:Logger_Init	24	static
-../Core/Src/sd_logger.c:130:6:Logger_Push	320	static
-../Core/Src/sd_logger.c:162:6:Logger_Service	32	static
-../Core/Src/sd_logger.c:194:17:Logger_Close	16	static
-../Core/Src/sd_logger.c:213:16:Logger_GetState	4	static
-../Core/Src/sd_logger.c:214:16:Logger_FileName	4	static
