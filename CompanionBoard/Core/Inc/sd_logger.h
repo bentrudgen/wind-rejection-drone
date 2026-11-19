@@ -29,6 +29,22 @@ typedef struct {
     uint8_t  arm_tx;     /* 1 = arm signal sent (AUX1 high) */
     uint8_t  fc_armed;   /* the FC's own armed state (MSP_STATUS), refreshed ~every 180 ms */
     uint8_t  link_ok;    /* pilot link alive */
+
+    /* Battery, from the FC (MSP_ANALOG), refreshed ~every 180 ms */
+    uint16_t vbat_deci;  /* battery voltage, 0.1 V (168 = 16.8 V) */
+    int16_t  amps_centi; /* current, 0.01 A (0 unless the FC has a current sensor set up) */
+    uint16_t mah_drawn;  /* mAh used since power-up */
+
+    /* Roll / pitch / yaw */
+    int16_t  cmd_roll;   /* command in effect (held or live stick), BEFORE scaling, us from centre (-500..+500) */
+    int16_t  cmd_pitch;
+    int16_t  cmd_yaw;
+    uint16_t tx_roll;    /* sent to the FC (after scaling; roll/pitch include the correction bias), us 1000..2000 */
+    uint16_t tx_pitch;
+    uint16_t tx_yaw;
+    int16_t  att_roll;   /* drone attitude from the FC: roll/pitch in 0.1 deg */
+    int16_t  att_pitch;
+    int16_t  att_yaw;    /* heading, whole degrees (0..359) */
 } log_record_t;
 
 typedef enum {
