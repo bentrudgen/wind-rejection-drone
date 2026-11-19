@@ -232,6 +232,36 @@ enum { AX_LX = 0, AX_LY = 1, AX_RX = 2, AX_RY = 3 };
 #error check THROTTLE_ARMED_START_US / THROTTLE_MAX_US (need 1000 <= start < max <= 2000)
 #endif
 
+/* Roll / pitch / yaw start values: what is sent to the FC right after arming (at the same moment the throttle
+ * jumps to THROTTLE_ARMED_START_US). Values are what the FC receives, 1000..2000 us, so 1500 = centre (no input).
+ *   - Works through STICK_HOLD: the value is loaded as the held value, so it stays until you change it with the
+ *     stick (a push the same way replaces it, a push the opposite way returns that axis to centre).
+ *   - Needs STICK_HOLD_ENABLE 1 and that axis's STICK_HOLD_<axis> 1; otherwise the stick would snap it back
+ *     to centre straight away, so it is ignored.
+ *   - Must be reachable with the stick at the current STICK_SCALE: within 1500 +/- 5 x STICK_SCALE_<axis>_PCT
+ *     (at 20%: 1400..1600). The build stops if it isn't.
+ *   - An axis with a non-centre start value counts as "pilot is using it", so the correction leaves that axis alone
+ *     until it is back at centre.
+ *   - Correction (roll/pitch bias) and the controller's live sticks still work on top as before. */
+#define ARMED_START_ROLL_US       1500         /* 1500 = centre */
+#define ARMED_START_PITCH_US      1500
+#define ARMED_START_YAW_US        1500
+
+/* start value (FC us) -> held stick value (before scaling) */
+#define ARMED_START_HELD(us, pct) ((pct) ? (int16_t)((((int32_t)(us) - 1500) * 100) / (pct)) : (int16_t)0)
+#if (ARMED_START_ROLL_US  - 1500) * 100 >  500 * STICK_SCALE_ROLL_PCT  || (ARMED_START_ROLL_US  - 1500) * 100 < -500 * STICK_SCALE_ROLL_PCT
+#error ARMED_START_ROLL_US is out of reach at this STICK_SCALE_ROLL_PCT (limit 1500 +/- 5 x scale)
+#endif
+#if (ARMED_START_PITCH_US - 1500) * 100 >  500 * STICK_SCALE_PITCH_PCT || (ARMED_START_PITCH_US - 1500) * 100 < -500 * STICK_SCALE_PITCH_PCT
+#error ARMED_START_PITCH_US is out of reach at this STICK_SCALE_PITCH_PCT (limit 1500 +/- 5 x scale)
+#endif
+#if (ARMED_START_YAW_US   - 1500) * 100 >  500 * STICK_SCALE_YAW_PCT   || (ARMED_START_YAW_US   - 1500) * 100 < -500 * STICK_SCALE_YAW_PCT
+#error ARMED_START_YAW_US is out of reach at this STICK_SCALE_YAW_PCT (limit 1500 +/- 5 x scale)
+#endif
+#if !STICK_HOLD_ENABLE && (ARMED_START_ROLL_US != 1500 || ARMED_START_PITCH_US != 1500 || ARMED_START_YAW_US != 1500)
+#warning ARMED_START_*_US are ignored because STICK_HOLD_ENABLE is 0
+#endif
+
 
 /* >>>>>> 1C. FC LINK AND SAFETY: MSP constants, loop timing, failsafe <<<<<< */
 /* =====================  MSP / protocol constants  =========================== */
@@ -899,6 +929,20 @@ static void stick_hold_clear(void)
 {
   for (uint8_t i = 0; i < 4; i++) stickHeldUs[i] = 0;
 }
+
+/* Called once per arming, when the throttle jumps to its start value: loads the roll/pitch/yaw start values */
+static void stick_hold_load_armed_start(void)
+{
+#if STICK_HOLD_ROLL
+  stickHeldUs[MAP_ROLL_AXIS]  = ARMED_START_HELD(ARMED_START_ROLL_US,  STICK_SCALE_ROLL_PCT);
+#endif
+#if STICK_HOLD_PITCH
+  stickHeldUs[MAP_PITCH_AXIS] = ARMED_START_HELD(ARMED_START_PITCH_US, STICK_SCALE_PITCH_PCT);
+#endif
+#if STICK_HOLD_YAW
+  stickHeldUs[MAP_YAW_AXIS]   = ARMED_START_HELD(ARMED_START_YAW_US,   STICK_SCALE_YAW_PCT);
+#endif
+}
 #endif
 
 static int32_t pkt_u(const uint8_t *buf, uint8_t off)
@@ -992,6 +1036,9 @@ static void lora_decode_packet(const uint8_t *buf, PilotFrame *frame)
   {
     thr = THROTTLE_ARMED_START_US; /* jump once to the start value; the stick takes it from here */
     armStartDone = 1;
+#if STICK_HOLD_ENABLE
+    stick_hold_load_armed_start(); /* and roll / pitch / yaw to theirs (held until changed with the stick) */
+#endif
   }
   else
   {
